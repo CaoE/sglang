@@ -187,7 +187,7 @@ def forward_moe_fused(
 
 
 def convert_weight_packed(weight):
-    return sgl_kernel.common_ops.convert_weight_packed(weight)
+    return torch.ops.sgl_kernel_cpu.convert_weight_packed(weight)
 
 
 def qkv_proj_with_rope(
@@ -209,7 +209,7 @@ def qkv_proj_with_rope(
     is_vnni=True,
     weight_block_size=None,
 ):
-    return sgl_kernel.common_ops.qkv_proj_with_rope(
+    return torch.ops.sgl_kernel_cpu.qkv_proj_with_rope(
         hidden_states,
         q_a_proj_weight,
         q_b_proj_weight,
@@ -279,7 +279,7 @@ def extend_attention(
     sm_scale,
     logit_cap=0.0,
 ):
-    sgl_kernel.common_ops.extend_attention_cpu(
+    torch.ops.sgl_kernel_cpu.extend_attention_cpu(
         q_extend,
         k_extend,
         v_extend,
@@ -345,7 +345,7 @@ def forward_absorb_decode_fused(
     o_proj_block_size,
     is_vnni=True,
 ):
-    return sgl_kernel.common_ops.forward_absorb_decode_fused_cpu(
+    return torch.ops.sgl_kernel_cpu.forward_absorb_decode_fused_cpu(
         hidden_states,
         q_a_proj_weight,
         q_b_proj_weight,
@@ -394,6 +394,68 @@ def forward_absorb_decode_fused(
         is_vnni,
     )
 
+@torch.library.register_fake("sgl_kernel_cpu::forward_absorb_decode_fused_cpu")
+def _(
+    hidden_states,
+    q_a_proj_weight,
+    q_b_proj_weight,
+    kv_a_proj_weight,
+    w_kc,
+    q_a_layernorm_weight,
+    kv_a_layernorm_weight,
+    positions,
+    cos_sin_cache,
+    k_cache,
+    v_cache,
+    loc,
+    attn_logits,
+    req_to_token,
+    req_pool_indices,
+    seq_lens,
+    w_vc,
+    o_proj_weight,
+    o_proj_bias,
+    eps,
+    use_int8_w8a8,
+    use_fp8_w8a16,
+    sm_scale,
+    logit_cap,
+    tp_k_head_num,
+    qk_head_dim,
+    tp_v_head_num,
+    v_head_dim,
+    tp_q_head_num,
+    num_local_heads,
+    kv_lora_rank,
+    tp_size,
+    tp_rank,
+    o_proj_use_int8_w8a8,
+    o_proj_use_fp8_w8a16,
+    o_proj_out_dtype,
+    q_a_proj_scale,
+    q_b_proj_scale,
+    kv_a_proj_scale,
+    block_size,
+    bmm_scale,
+    process_group,
+    op,
+    o_proj_scale,
+    o_proj_block_size,
+    is_vnni):
+    num_seqs = hidden_states.shape[0]
+    num_heads = w_kc.shape[0]
+    kv_lora_rank = w_kc.shape[1]
+    qk_rope_head_dim = kv_a_proj_weight.shape[0] - kv_lora_rank
+    query = hidden_states.new_empty(num_seqs, num_heads, qk_rope_head_dim)
+    
+    query= query.reshape(-1, tp_q_head_num * qk_head_dim)
+    if qk_head_dim != v_head_dim:
+        attn_output = query.new_empty(query.shape[0], tp_q_head_num * v_head_dim)
+    else:
+        attn_output = query
+    M = attn_output.shape[0]
+    N = o_proj_weight.shape[1]
+    return attn_output.new_empty(M, N)
 
 def weight_packed_linear(
     x,
@@ -459,7 +521,7 @@ def biased_grouped_topk(
     num_expert_group,
     topk_group,
 ):
-    return sgl_kernel.common_ops.biased_grouped_topk_cpu(
+    return torch.ops.sgl_kernel_cpu.biased_grouped_topk_cpu(
         hidden_states,
         router_logits,
         bias,
@@ -511,7 +573,7 @@ def int8_scaled_mm(
     out_dtype,
     is_vnni=True,
 ):
-    return sgl_kernel.common_ops.int8_scaled_mm_cpu(
+    return torch.ops.sgl_kernel_cpu.int8_scaled_mm_cpu(
         mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni
     )
 
@@ -524,13 +586,13 @@ def int8_scaled_mm_with_quant(
     out_dtype,
     is_vnni=True,
 ):
-    return sgl_kernel.common_ops.int8_scaled_mm_with_quant(
+    return torch.ops.sgl_kernel_cpu.int8_scaled_mm_with_quant(
         mat1, mat2, scales2, bias, out_dtype, is_vnni
     )
 
 
 def per_token_quant_int8(x):
-    return sgl_kernel.common_ops.per_token_quant_int8_cpu(x)
+    return torch.ops.sgl_kernel_cpu.per_token_quant_int8_cpu(x)
 
 
 def fp8_scaled_mm(

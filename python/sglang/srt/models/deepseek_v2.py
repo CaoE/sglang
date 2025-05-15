@@ -1347,8 +1347,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             params.kv_a_proj_with_mqa_weight_scale,
             params.weight_block_size,
             None,  # bmm_scale
-            params.device_group,
-            params.reduce_op,
+            params.device_group.group_name if params.device_group else None,
+            "sum" if params.reduce_op else None,
             params.o_proj_scale,
             params.o_proj_weight_block_size,
         )
