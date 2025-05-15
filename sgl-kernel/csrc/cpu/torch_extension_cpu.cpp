@@ -33,7 +33,7 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(at::Tensor& hidden_states, a
     int64_t topk, bool renormalize, int64_t num_expert_group, int64_t topk_group);
 
 std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(at::Tensor& hidden_states, at::Tensor& gating_output,
-    at::Tensor& correction_bias, int64_t topk, bool renormalize, int64_t num_expert_group, int64_t topk_group);
+    const at::Tensor& correction_bias, int64_t topk, bool renormalize, int64_t num_expert_group, int64_t topk_group);
 
 // attention
 void decode_attention_cpu(at::Tensor& query, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& output,
@@ -67,32 +67,32 @@ at::Tensor forward_absorb_decode_fused_cpu(
     at::Tensor& seq_lens, // decode_attention_cpu
     at::Tensor& w_vc, // bmm
     at::Tensor& o_proj_weight, // o_proj
-    std::optional<at::Tensor>& o_proj_bias, // o_proj
+    const std::optional<at::Tensor>& o_proj_bias, // o_proj
     double eps, // qkv_proj_with_rope
     bool use_int8_w8a8, // qkv_proj_with_rope
     bool use_fp8_w8a16, // qkv_proj_with_rope
     double sm_scale, // decode_attention_cpu
     double logit_cap, // decode_attention_cpu
-    int tp_k_head_num, // decode_attention_cpu
-    int qk_head_dim, // decode_attention_cpu
-    int tp_v_head_num, // decode_attention_cpu
-    int v_head_dim, // decode_attention_cpu
-    int tp_q_head_num, // decode_attention_cpu
-    int num_local_heads, // decode_attention_cpu
-    int kv_lora_rank, // decode_attention_cpu
-    int tp_size, // o_proj
-    int tp_rank, // o_proj
+    int64_t tp_k_head_num, // decode_attention_cpu
+    int64_t qk_head_dim, // decode_attention_cpu
+    int64_t tp_v_head_num, // decode_attention_cpu
+    int64_t v_head_dim, // decode_attention_cpu
+    int64_t tp_q_head_num, // decode_attention_cpu
+    int64_t num_local_heads, // decode_attention_cpu
+    int64_t kv_lora_rank, // decode_attention_cpu
+    int64_t tp_size, // o_proj
+    int64_t tp_rank, // o_proj
     bool o_proj_use_int8_w8a8, // o_proj
     bool o_proj_use_fp8_w8a16, // o_proj
     at::ScalarType o_proj_out_dtype, // o_proj
-    std::optional<at::Tensor>& q_a_proj_scale, // qkv_proj_with_rope
-    std::optional<at::Tensor>& q_b_proj_scale, // qkv_proj_with_rope
-    std::optional<at::Tensor>& kv_a_proj_scale, // qkv_proj_with_rope
+    const std::optional<at::Tensor>& q_a_proj_scale, // qkv_proj_with_rope
+    const std::optional<at::Tensor>& q_b_proj_scale, // qkv_proj_with_rope
+    const std::optional<at::Tensor>& kv_a_proj_scale, // qkv_proj_with_rope
     std::optional<std::vector<int64_t>> block_size, // qkv_proj_with_rope
-    std::optional<at::Tensor>& bmm_scale, // bmm
+    const std::optional<at::Tensor>& bmm_scale, // bmm
     std::optional<std::string> process_group, // o_proj
     std::optional<std::string> op, // o_proj
-    std::optional<at::Tensor>& o_proj_scale, // o_proj
+    const std::optional<at::Tensor>& o_proj_scale, // o_proj
     std::optional<std::vector<int64_t>> o_proj_block_size, // o_proj
     bool is_vnni  // qkv_proj_with_rope, bmm, o_proj
 );
@@ -110,16 +110,16 @@ at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
 // igemm
 at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
     at::Tensor& scales1, at::Tensor& scales2,
-    std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
+    const std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
 
 // fp8 gemm
 at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
-    at::Tensor& scales2, std::vector<int64_t> block_size,
+    const at::Tensor& scales2, std::vector<int64_t> block_size,
     const std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
 
 // quant + igemm
-at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2,
-    std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
+at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2, const at::Tensor& scales2,
+    const std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni,
@@ -161,12 +161,12 @@ at::Tensor shared_expert_cpu(
 at::Tensor forward_moe_fused_cpu(
     at::Tensor& hidden_states, // MoEGate
     at::Tensor& MoEGate_weight, // MoEGate
-    std::optional<at::Tensor>& bias, // MoEGate
+    const std::optional<at::Tensor>& bias, // MoEGate
     at::Tensor& fused_experts_w13_weight, // experts
     at::Tensor& fused_experts_w2_weight, // experts
     at::Tensor& shared_expert_w1, // shared_expert
     at::Tensor& shared_expert_w2, // shared_expert
-    int top_k, // select_experts
+    int64_t top_k, // select_experts
     bool use_grouped_topk, // select_experts
     bool renormalize, // select_experts
     bool fused_experts_use_int8_w8a8, // experts
@@ -176,20 +176,20 @@ at::Tensor forward_moe_fused_cpu(
     bool shared_expert_inplace, // shared_expert
     bool shared_expert_use_int8_w8a8, // shared_expert
     bool shared_expert_use_fp8_w8a16, // shared_expert
-    int tp_size, // all_reduce
-    std::optional<int> topk_group, // select_experts
-    std::optional<int> num_expert_group, // select_experts
-    std::optional<at::Tensor>& correction_bias, // select_experts
-    std::optional<at::Tensor>& fused_experts_w1_scale, // experts
-    std::optional<at::Tensor>& fused_experts_w2_scale, // experts
-    std::optional<at::Tensor>& fused_experts_a1_scale, // experts
-    std::optional<at::Tensor>& fused_experts_a2_scale, // experts
+    int64_t tp_size, // all_reduce
+    std::optional<int64_t> topk_group, // select_experts
+    std::optional<int64_t> num_expert_group, // select_experts
+    const std::optional<at::Tensor>& correction_bias, // select_experts
+    const std::optional<at::Tensor>& fused_experts_w1_scale, // experts
+    const std::optional<at::Tensor>& fused_experts_w2_scale, // experts
+    const std::optional<at::Tensor>& fused_experts_a1_scale, // experts
+    const std::optional<at::Tensor>& fused_experts_a2_scale, // experts
     std::optional<std::vector<int64_t>> fused_experts_block_size, // experts
-    std::optional<at::Tensor>& shared_expert_w1_scale, // shared_expert
-    std::optional<at::Tensor>& shared_expert_w2_scale, // shared_expert
-    std::optional<std::vector<int64_t>> shared_expert_block_size, // shared_expert
-    std::optional<at::Tensor>& shared_expert_a1_scale, // shared_expert
-    std::optional<at::Tensor>& shared_expert_a2_scale,     // shared_expert
+    const std::optional<at::Tensor>& shared_expert_w1_scale, // shared_expert
+    const std::optional<at::Tensor>& shared_expert_w2_scale, // shared_expert
+    const std::optional<std::vector<int64_t>> shared_expert_block_size, // shared_expert
+    const std::optional<at::Tensor>& shared_expert_a1_scale, // shared_expert
+    const std::optional<at::Tensor>& shared_expert_a2_scale,     // shared_expert
     std::optional<std::string> process_group, // all_reduce
     std::optional<std::string> op, // all_reduce
     bool is_vnni // MoEGate, experts, shared_expert
@@ -200,8 +200,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope( at::Tensor& h
     at::Tensor& q_a_proj_weight, at::Tensor& q_b_proj_weight, at::Tensor& kv_a_proj_weight,
     at::Tensor& w_kc, at::Tensor& q_a_layernorm_weight, at::Tensor& kv_a_layernorm_weight,
     at::Tensor& positions, at::Tensor& cos_sin_cache, double eps, bool use_int8_w8a8, bool use_fp8_w8a16,
-    std::optional<at::Tensor>& q_a_proj_scale, std::optional<at::Tensor>& q_b_proj_scale,
-    std::optional<at::Tensor>& kv_a_proj_scale, bool is_vnni, std::optional<std::vector<int64_t>> block_size);
+    const std::optional<at::Tensor>& q_a_proj_scale, const std::optional<at::Tensor>& q_b_proj_scale,
+    const std::optional<at::Tensor>& kv_a_proj_scale, bool is_vnni, std::optional<std::vector<int64_t>> block_size);
 
 // shared memory init
 void initialize(int size, int rank);
@@ -295,6 +295,66 @@ TORCH_LIBRARY(sgl_kernel_cpu, m) {
 
   m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
   IMPL_CPU(weight_packed_linear);
+
+  m.def(
+    "biased_grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, Tensor correction_bias, int topk, bool "
+    "renormalize, int num_expert_group, int topk_group) -> (Tensor, Tensor)");
+  IMPL_CPU(biased_grouped_topk_cpu);
+
+  m.def(
+    "extend_attention_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor o_extend, Tensor k_buffer, "
+    "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
+    "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
+  IMPL_CPU(extend_attention_cpu);
+
+  m.def("convert_weight_packed(Tensor weight) -> Tensor");
+  IMPL_CPU(convert_weight_packed);
+
+  m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
+  IMPL_CPU(per_token_quant_int8_cpu);
+
+  m.def(
+    "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
+    "out_dtype, bool is_vnni) -> Tensor");
+  IMPL_CPU(int8_scaled_mm_cpu);
+
+  m.def(
+    "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType out_dtype, bool "
+    "is_vnni) -> Tensor");
+  IMPL_CPU(int8_scaled_mm_with_quant);
+
+  m.def(
+    "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
+    "kv_a_proj_weight, Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
+    "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? q_a_proj_scale, Tensor? q_b_proj_scale, Tensor? "
+    "kv_a_proj_scale, bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
+  IMPL_CPU(qkv_proj_with_rope);
+
+  m.def("forward_absorb_decode_fused_cpu(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor kv_a_proj_weight,"
+                                        "Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions,"
+                                        "Tensor cos_sin_cache, Tensor k_cache, Tensor v_cache, Tensor loc, Tensor attn_logits,"
+                                        "Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor w_vc, Tensor o_proj_weight, Tensor? o_proj_bias,"
+                                        "float eps, bool use_int8_w8a8, bool use_fp8_w8a16, float sm_scale, float logit_cap, int tp_k_head_num, int qk_head_dim,"
+                                        "int tp_v_head_num, int v_head_dim, int tp_q_head_num, int num_local_heads, int kv_lora_rank, int tp_size, int tp_rank,"
+                                        "bool o_proj_use_int8_w8a8, bool o_proj_use_fp8_w8a16,"
+                                        "ScalarType o_proj_out_dtype, Tensor? q_a_proj_scale, Tensor? q_b_proj_scale,"
+                                        "Tensor? kv_a_proj_scale, int[]? block_size, Tensor? bmm_scale,"
+                                        "str? process_group, str? op,  Tensor? o_proj_scale, int[]? o_proj_block_size, bool is_vnni) -> Tensor");
+  IMPL_CPU(forward_absorb_decode_fused_cpu);
+
+  m.def("forward_moe_fused_cpu(Tensor hidden_states, Tensor MoEGate_weight, Tensor? bias, Tensor fused_experts_w13_weight, Tensor fused_experts_w2_weight,"
+                                        "Tensor shared_expert_w1, Tensor shared_expert_w2, int top_k, bool use_grouped_topk,"
+                                        "bool renormalize, bool fused_experts_use_int8_w8a8, bool fused_experts_use_fp8_w8a16,"
+                                        "bool fused_experts_inplace, float routed_scaling_factor, bool shared_expert_inplace,"
+                                        "bool shared_expert_use_int8_w8a8, bool shared_expert_use_fp8_w8a16, int tp_size,"
+                                        "int? topk_group, int? num_expert_group, Tensor? correction_bias,"
+                                        "Tensor? fused_experts_w1_scale, Tensor? fused_experts_w2_scale,"
+                                        "Tensor? fused_experts_a1_scale, Tensor? fused_experts_a2_scale,"
+                                        "int[]? fused_experts_block_size, Tensor? shared_expert_w1_scale,"
+                                        "Tensor? shared_expert_w2_scale, int[]? shared_expert_block_size,"
+                                        "Tensor? shared_expert_a1_scale, Tensor? shared_expert_a2_scale,"
+                                        "str? process_group, str? op, bool is_vnni) -> Tensor");
+  IMPL_CPU(forward_moe_fused_cpu);
 
   m.def("fp8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, int[] block_size, Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");
   IMPL_CPU(fp8_scaled_mm_cpu);

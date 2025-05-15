@@ -452,7 +452,7 @@ def compute_position_torch(
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
 
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+# remove the compile decorator to avoid multiple graphs in compile mode 
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
