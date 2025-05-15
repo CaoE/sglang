@@ -1002,6 +1002,7 @@ class ModelRunner:
                 forward_batch, skip_attn_backend_init=skip_attn_backend_init
             )
 
+        # only enable compile for decode
         if (
             forward_batch.forward_mode.is_decode()
             and self.cpu_compile_runner is not None

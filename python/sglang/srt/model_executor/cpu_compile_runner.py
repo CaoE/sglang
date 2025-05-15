@@ -100,7 +100,7 @@ def get_batch_sizes_to_compile(model_runner: ModelRunner):
             if server_args.disable_cuda_graph_padding:
                 capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
             else:
-                capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+                capture_bs = [1, 2, 4, 7] + [i * 8 for i in range(1, 21)]
         else:
             capture_bs = list(range(1, 33))
 
@@ -181,7 +181,9 @@ class CpuCompileRunner:
         # Graph inputs
         # NOTE: we don't actually need this
         with torch.device("cpu"):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            # use dtype=torch.int32 to align with the benchmark
+            # TODO use more flexible dtypes
+            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int32)
             # cuda_graph_runner uses
             # - int32 for req_pool_indices and seq_lens
             # - int64 for out_cache_loc
@@ -349,9 +351,10 @@ class CpuCompileRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         # trigger torch.compile()
-        for _ in range(2):
-            self.model_runner.tp_group.barrier()
-            forward(input_ids, positions, forward_batch)
+        with torch.no_grad():
+            for _ in range(2):
+                self.model_runner.tp_group.barrier()
+                forward(input_ids, positions, forward_batch)
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
         # If the capture_hidden_mode changes, we need to recapture the graph
