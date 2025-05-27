@@ -66,7 +66,7 @@ def patch_model(
                 torch.no_grad()(model.forward),
                 fullgraph=True,
                 mode="max-autotune-no-cudagraphs",
-                dynamic=False,
+                dynamic=True, # TODO explore a best way to set dynamic
             )
         else:
             yield model.forward
@@ -128,6 +128,8 @@ def get_batch_sizes_to_compile(model_runner: ModelRunner):
         if server_args.enable_torch_compile
         else []
     )
+    # TODO improve speculative bs
+    compile_bs = [30, 1000] + compile_bs
     return compile_bs
 
 
@@ -139,7 +141,7 @@ class CpuCompileRunner:
         self.model_runner = model_runner
         # self.graphs = {}
         # self.output_buffers = {}
-        self.compiled_forwards = {}
+        self.compiled_forward = None
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -250,18 +252,21 @@ class CpuCompileRunner:
             self.model_runner.model.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
+        # TODO update the check for dynamic compile
+        return True
+
         if self.enable_dp_attention:
             min_num_tokens, max_num_tokens = min(
                 forward_batch.global_num_tokens_cpu
             ), max(forward_batch.global_num_tokens_cpu)
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                (min_num_tokens == max_num_tokens and max_num_tokens in self.compiled_forwards)
+                (min_num_tokens == max_num_tokens and max_num_tokens in self.compiled_forward)
                 if self.disable_padding
                 else max_num_tokens <= self.max_bs
             )
         else:
             is_bs_supported = (
-                forward_batch.batch_size in self.compiled_forwards
+                forward_batch.batch_size in self.compiled_forward
                 if self.disable_padding
                 else forward_batch.batch_size <= self.max_bs
             )
@@ -285,15 +290,15 @@ class CpuCompileRunner:
             if get_tensor_model_parallel_rank() == 0
             else reversed(self.compile_bs)
         )
-        for bs in capture_range:
-            with patch_model(
-                self.model_runner.model,
-                True,
-                num_tokens=bs * self.num_tokens_per_bs,
-                tp_group=self.model_runner.tp_group,
-            ) as forward:
+        with patch_model(
+            self.model_runner.model,
+            True,
+            num_tokens=1 * self.num_tokens_per_bs,
+            tp_group=self.model_runner.tp_group,
+        ) as forward:
+            for bs in capture_range:
                 self.capture_one_batch_size(bs, forward)
-                self.compiled_forwards[bs] = forward
+            self.compiled_forward = forward
                 # self.graphs[bs] = graph
                 # self.output_buffers[bs] = output_buffers
 
@@ -397,7 +402,7 @@ class CpuCompileRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         # Replay
-        logits_output = self.compiled_forwards[bs](
+        logits_output = self.compiled_forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
