@@ -46,7 +46,6 @@ class BasevLLMParameter(Parameter):
 
         :returns: a torch.nn.parameter
         """
-        self._data = data
         self._weight_loader = weight_loader
 
     @property
@@ -277,7 +276,7 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     """
 
     def __tensor_flatten__(self):
-        return ["_data"], [
+        return ["data"], [
             self.requires_grad,
             self._weight_loader,
             self._output_dim,
@@ -285,17 +284,16 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride):
-        out = ChannelQuantScaleParameter(data=inner_tensors["_data"], output_dim=ctx[2], weight_loader=ctx[1])
+        out = ChannelQuantScaleParameter(data=inner_tensors["data"], output_dim=ctx[2], weight_loader=ctx[1])
         return out
 
-    # This will reduce the performance on eager mode
-    # TODO eliminate the overhead for eager mode
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):
-        if kwargs is None:
-            kwargs = {}
-        args_data = pytree.tree_map_only(ChannelQuantScaleParameter, lambda x: x._data, args)
-        return func(*args_data, **kwargs)
+        with torch._C._DisableTorchDispatch():
+            if kwargs is None:
+                kwargs = {}
+            args_data = pytree.tree_map_only(ChannelQuantScaleParameter, lambda x: x._data, args)
+            return func(*args_data, **kwargs)
 
     @classmethod
     def __metadata_guard__(cls, orig_data, other):
@@ -307,13 +305,13 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     def __copy__(self):
         new_param = ChannelQuantScaleParameter(data=self._data, output_dim=self.output_dim, weight_loader=self.weight_loader)
         for k, v in self.__dict__.items():
-            if k != "_data":
+            if k != "data":
                 setattr(new_param, k, copy.copy(v))
         return new_param
 
     def __deepcopy__(self, memo):
         new_param = ChannelQuantScaleParameter(
-            data=copy.deepcopy(self._data, memo), output_dim=self.output_dim, weight_loader=copy.deepcopy(self.weight_loader, memo)
+            data=copy.deepcopy(self.data, memo), output_dim=self.output_dim, weight_loader=copy.deepcopy(self.weight_loader, memo)
         )
         for k, v in self.__dict__.items():
             setattr(new_param, k, copy.deepcopy(v, memo))

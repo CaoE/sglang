@@ -1010,16 +1010,18 @@ class ModelRunner:
         ):
             return self.cpu_compile_runner.replay(forward_batch)
 
-        if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(forward_batch)
-        elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(
-                forward_batch, skip_attn_backend_init=skip_attn_backend_init
-            )
-        elif forward_batch.forward_mode.is_idle():
-            return self.forward_idle(forward_batch)
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+        # disable torch dispatch for the eager mode
+        with torch._C._DisableTorchDispatch():
+            if forward_batch.forward_mode.is_decode():
+                return self.forward_decode(forward_batch)
+            elif forward_batch.forward_mode.is_extend():
+                return self.forward_extend(
+                    forward_batch, skip_attn_backend_init=skip_attn_backend_init
+                )
+            elif forward_batch.forward_mode.is_idle():
+                return self.forward_idle(forward_batch)
+            else:
+                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
