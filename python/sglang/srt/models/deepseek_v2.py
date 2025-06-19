@@ -272,6 +272,7 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts_down_proj,
             )
         )
+        # return self.forward_normal(hidden_states)
         if has_shared_experts and use_intel_amx_backend:
             return self.forward_moe_fused_cpu(hidden_states)
         else:
@@ -336,8 +337,8 @@ class DeepseekV2MoE(nn.Module):
             shared_experts_weight_block_size if shared_experts_is_fp8 else None,
             None,  # shared_expert_a1_scale
             None,  # shared_expert_a2_scale
-            get_tp_group().device_group if self.tp_size > 1 else None,
-            torch.distributed.ReduceOp.SUM if self.tp_size > 1 else None,
+            get_tp_group().device_group.group_name if self.tp_size > 1 else None,
+            "sum" if self.tp_size > 1 else None,
         )
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -346,10 +347,12 @@ class DeepseekV2MoE(nn.Module):
         if self.gate_impl is None:
             self.gate_impl = self.gate.forward
         # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate_impl(hidden_states)
+        # router_logits = self.gate_impl(hidden_states)
+        router_logits = self.gate(hidden_states)
         if self.experts_impl is None:
             self.experts_impl = self.experts.forward
-        fused_experts_out = self.experts_impl(
+        # fused_experts_out = self.experts_impl(
+        fused_experts_out = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
 
@@ -1344,8 +1347,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             params.kv_a_proj_with_mqa_weight_scale,
             params.weight_block_size,
             None,  # bmm_scale
-            params.device_group,
-            params.reduce_op,
+            params.device_group.group_name if params.device_group else None,
+            "sum" if params.reduce_op else None,
             params.o_proj_scale,
             params.o_proj_weight_block_size,
         )
