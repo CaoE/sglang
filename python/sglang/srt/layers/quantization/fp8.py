@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Tuple
 
 import torch
 import torch.nn.functional as F
+import torchao
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -1065,13 +1066,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if self.quant_config.activation_scheme == "static":
-            q_input = torch.ops.quantized_decomposed.quantize_per_tensor(
-                input=x,
+            q_input = torch.ops.torchao.quantize_affine_float8(
+                tensor=x,
                 scale=layer.input_scale,
-                zero_point=0,
-                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
-                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
-                dtype=torch.float8_e4m3fn,
+                float8_dtype=torch.float8_e4m3fn
             )
             return torch._scaled_mm(
                 q_input,
