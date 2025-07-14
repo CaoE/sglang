@@ -568,6 +568,18 @@ void store_cache_cpu(
 void copy_all_layer_kv_cache_cpu(
     const at::Tensor& data_ptrs, const at::Tensor& strides, const at::Tensor& tgt_loc, const at::Tensor& src_loc);
 
+std::tuple<at::Tensor, at::Tensor>
+float8_linear_prepack_impl(
+    const at::Tensor& weight,
+    const at::Tensor& scales);
+at::Tensor float8_linear_impl(
+    const at::Tensor& input,
+    const at::Tensor& input_scales,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -581,6 +593,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
   m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate, bool inplace) -> Tensor(a!)");
   m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
+
+  m.def("float8_linear_prepack_cpu(Tensor weight, Tensor scales) -> (Tensor, Tensor)");
+  m.impl("float8_linear_prepack_cpu", torch::kCPU, &float8_linear_prepack_impl);
+
+  m.def("float8_linear_cpu(Tensor input, Tensor input_scales, Tensor weight, Tensor weight_scales, Tensor? bias, ScalarType output_dtype) -> Tensor");
+  m.impl("float8_linear_cpu", torch::kCPU, &float8_linear_impl);
 
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
