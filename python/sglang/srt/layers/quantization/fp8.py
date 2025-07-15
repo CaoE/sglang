@@ -743,8 +743,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 _is_cpu_amx_available
             ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
             # _amx_process_weight_after_loading(layer, ["weight"])
-            if SGLANG_DEEPSEEK_FP8A8 and not "shared_experts" in self.prefix:
+            layer.use_f8f8 = False
+            if SGLANG_DEEPSEEK_FP8A8 and not "shared_experts" in self.prefix and  not "qkv_a" in self.prefix and  not "q_b_proj" in self.prefix:
                 layer.use_intel_amx_backend = True
+                layer.use_f8f8 = True
                 if layer.weight_scale_inv.size(0) != layer.weight.size(0):
                     weight_scale_inv = torch.repeat_interleave(layer.weight_scale_inv, 128, 0)
                     weight_scale_inv = weight_scale_inv[: layer.weight.size(0), :].contiguous()
@@ -1066,10 +1068,9 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.block_quant:
             if use_intel_amx_backend(layer):
-                if SGLANG_DEEPSEEK_FP8A8:
+                if SGLANG_DEEPSEEK_FP8A8 and layer.use_f8f8:
                     x_q, x_s = _quantize_fp8e4m3(x , True)
                     # x_zp = torch.zeros_like(x_s).to(torch.int)
-
                     return torch.ops.sgl_kernel.float8_linear_cpu(
                             x_q, x_s, layer.weight, layer.weight_scale_inv, bias, torch.bfloat16)
                 else:
