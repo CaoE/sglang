@@ -4,8 +4,6 @@
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
 
-#define CPUBLAS_BRGEMM_F8F8BF16
-
 namespace {
 
 #define BLOCK_N 32
@@ -19,6 +17,7 @@ bool cpublas_could_pack() {
     return cpublas_can_pack;
   }
 #ifdef CPUBLAS_BRGEMM_F8F8BF16
+  std::cout<<"Using F8F8 packing..."<<std::endl;
   cpublas_can_pack = at::native::cpublas::could_pack(at::kFloat8_e4m3fn);
 #else
   cpublas_can_pack = at::native::cpublas::could_pack(at::kBFloat16);
