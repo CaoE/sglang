@@ -21,7 +21,6 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -90,7 +89,8 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.cuda_graph_runner import GraphRunner
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
@@ -1489,10 +1489,10 @@ class ModelRunner:
             f"Capture graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         if device=="cuda":
-            self.cuda_graph_runner = GraphRunner(self, device=device)
+            self.cuda_graph_runner = CudaGraphRunner(self)
         else:
             assert device == "cpu", "Only cuda and cpu are supported for graph capture."
-            self.cpu_graph_runner = GraphRunner(self, device=device)
+            self.cpu_graph_runner = CPUGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
@@ -1660,7 +1660,7 @@ class ModelRunner:
             # For MLP sync
             if forward_batch.global_num_tokens_cpu is not None:
                 forward_batch.prepare_mlp_sync_batch(self)
-            # disable torch dispatch for the eager mode
+            # disable torch dispatch for the non-graph mode to avoid additional overhead
             with torch._C._DisableTorchDispatch():
                 if forward_batch.forward_mode.is_decode():
                     ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)

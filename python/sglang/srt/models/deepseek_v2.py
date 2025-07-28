@@ -2023,7 +2023,7 @@ class DeepseekV2Model(nn.Module):
         )
         for i in range(normal_num_layers):
             # Create a dynamo-compatible approach to record expert distribution
-            if torch._dynamo.is_compiling():
+            if torch.compiler.is_compiling():
                 # Skip the context manager during compilation
                 layer = self.layers[i]
                 hidden_states, residual = layer(
