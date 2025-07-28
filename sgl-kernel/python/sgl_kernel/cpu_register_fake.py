@@ -45,7 +45,10 @@ def _(
     cos_sin_cache,
     is_neox
 ):
-    return torch.empty_like(query), torch.empty_like(key)
+    if query.ndim == 2:
+        return query, key
+    else:
+        return torch.empty_like(query), torch.empty_like(key)
 
 @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
 def _(
