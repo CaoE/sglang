@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.graph_runner import GraphRunner
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
@@ -47,7 +48,6 @@ from sglang.srt.utils import (
     get_device_memory_capacity,
     rank0_log,
 )
-from sglang.srt.model_executor.graph_runner import GraphRunner
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def patch_model(
     num_tokens: int,
     tp_group: GroupCoordinator,
 ):
-    """Patch the model to make it compatible with with torch.compile"""
+    """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
 
     try:
@@ -209,7 +209,7 @@ class CudaGraphRunner(GraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner, device="cuda")
-        
+
         if model_runner.spec_algorithm.is_eagle():
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")

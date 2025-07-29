@@ -1,11 +1,13 @@
 import torch
 
+
 @torch.library.register_fake("sgl_kernel::shm_allreduce")
 def _(
     data,
     reduce_op,
 ) -> None:
     return
+
 
 @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope")
 def _(
@@ -25,30 +27,37 @@ def _(
     q_b_proj_scale,
     kv_a_proj_scale,
     is_vnni,
-    block_size
+    block_size,
 ):
     num_seqs = hidden_states.shape[0]
     num_heads = w_kc.shape[0]
     kv_lora_rank = w_kc.shape[1]
     qk_rope_head_dim = kv_a_proj_weight.shape[0] - kv_lora_rank
-    q_input = torch.empty(num_seqs, num_heads, kv_lora_rank + qk_rope_head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
-    k_input = torch.empty(num_seqs, 1, kv_lora_rank + qk_rope_head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+    q_input = torch.empty(
+        num_seqs,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    k_input = torch.empty(
+        num_seqs,
+        1,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
     v_input = k_input.narrow(-1, 0, kv_lora_rank)
     return q_input, k_input, v_input
 
+
 @torch.library.register_fake("sgl_kernel::rotary_embedding_cpu")
-def _(
-    positions,
-    query,
-    key,
-    head_size,
-    cos_sin_cache,
-    is_neox
-):
+def _(positions, query, key, head_size, cos_sin_cache, is_neox):
     if query.ndim == 2:
         return query, key
     else:
         return torch.empty_like(query), torch.empty_like(key)
+
 
 @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
 def _(
@@ -69,38 +78,47 @@ def _(
     block_size,
     q_lora_rank,
     kv_lora_rank,
-    qk_rope_head_dim):
+    qk_rope_head_dim,
+):
     num_seqs = hidden_states.shape[0]
     num_heads = w_kc.shape[0]
     kv_lora_rank = w_kc.shape[1]
-    weight_chunks = torch.split(q_a_proj_weight, [q_lora_rank, kv_lora_rank + qk_rope_head_dim], dim=0)
+    weight_chunks = torch.split(
+        q_a_proj_weight, [q_lora_rank, kv_lora_rank + qk_rope_head_dim], dim=0
+    )
     qk_rope_head_dim = weight_chunks[1].shape[0] - kv_lora_rank
-    q_input = torch.empty(num_seqs, num_heads, kv_lora_rank + qk_rope_head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
-    k_input = torch.empty(num_seqs, 1, kv_lora_rank + qk_rope_head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+    q_input = torch.empty(
+        num_seqs,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    k_input = torch.empty(
+        num_seqs,
+        1,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
     v_input = k_input.narrow(-1, 0, kv_lora_rank)
     return q_input, k_input, v_input
 
+
 @torch.library.register_fake("sgl_kernel::bmm_cpu")
-def _(
-    out,
-    mat1,
-    mat2,
-    is_vnni,
-    scale)-> None:
+def _(out, mat1, mat2, is_vnni, scale) -> None:
     return
 
+
 @torch.library.register_fake("sgl_kernel::fused_add_rmsnorm_cpu")
-def _(
-    input,
-    residual,
-    weight,
-    eps
-) -> None:
+def _(input, residual, weight, eps) -> None:
     return
+
 
 @torch.library.register_fake("sgl_kernel::weight_packed_linear")
 def _(x, weight, bias, is_vnni):
     return x.new_empty(x.shape[0], weight.shape[0])
+
 
 @torch.library.register_fake("sgl_kernel::shared_expert_cpu")
 def _(
@@ -121,6 +139,7 @@ def _(
 ):
     return torch.empty_like(hidden_states)
 
+
 @torch.library.register_fake("sgl_kernel::decode_attention_cpu")
 def _(
     query,
@@ -135,8 +154,10 @@ def _(
     req_pool_indices,
     seq_lens,
     sm_scale,
-    logit_cap,)-> None:
+    logit_cap,
+) -> None:
     return
+
 
 @torch.library.register_fake("sgl_kernel::extend_attention_cpu")
 def _(
@@ -153,8 +174,10 @@ def _(
     extend_start_loc,
     max_len_extend,
     sm_scale,
-    logit_cap)-> None:
+    logit_cap,
+) -> None:
     return
+
 
 @torch.library.register_fake("sgl_kernel::per_token_quant_int8_cpu")
 def _(input):
@@ -164,21 +187,15 @@ def _(input):
     As = input.new_empty(M, dtype=torch.float32)
     return Aq, As
 
+
 @torch.library.register_fake("sgl_kernel::int8_scaled_mm_cpu")
-def _(
-    mat1,
-    mat2,
-    scales1,
-    scales2,
-    bias,
-    out_dtype,
-    is_vnni
-):
+def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
     M = mat1.shape[0]
     N = mat2.shape[0]
     k = mat1.shape[1]
     out = mat1.new_empty(M, N, dtype=out_dtype)
     return out
+
 
 @torch.library.register_fake("sgl_kernel::fused_experts_cpu")
 def _(
@@ -198,6 +215,7 @@ def _(
     is_vnni,
 ):
     return torch.empty_like(x)
+
 
 @torch.library.register_fake("sgl_kernel::grouped_topk_cpu")
 def _(
@@ -219,6 +237,7 @@ def _(
     topk_ids = torch.empty(shape, device=device, dtype=torch.int)
     return topk_weights, topk_ids
 
+
 @torch.library.register_fake("sgl_kernel::biased_grouped_topk_cpu")
 def _(
     hidden_states,
@@ -239,6 +258,7 @@ def _(
     topk_ids = torch.empty(shape, device=device, dtype=torch.int)
     return topk_weights, topk_ids
 
+
 @torch.library.register_fake("sgl_kernel::rmsnorm_cpu")
 def _(input, weight, eps):
     return torch.empty_like(input)
@@ -248,19 +268,16 @@ def _(input, weight, eps):
 def _(input, eps):
     return torch.empty_like(input)
 
+
 @torch.library.register_fake("sgl_kernel::topk_sigmoid_cpu")
-def _(
-    hidden_states,
-    gating_output,
-    topk,
-    renormalize
-):
+def _(hidden_states, gating_output, topk, renormalize):
     num_tokens = hidden_states.shape[0]
     shape = (num_tokens, topk)
     return (
-            torch.empty(shape, device=hidden_states.device, dtype=torch.float),
-            torch.empty(shape, device=hidden_states.device, dtype=torch.int)
-            )
+        torch.empty(shape, device=hidden_states.device, dtype=torch.float),
+        torch.empty(shape, device=hidden_states.device, dtype=torch.int),
+    )
+
 
 @torch.library.register_fake("sgl_kernel::topk_softmax_cpu")
 def _(
@@ -272,13 +289,15 @@ def _(
     num_tokens = hidden_states.shape[0]
     shape = (num_tokens, topk)
     return (
-            torch.empty(shape, device=hidden_states.device, dtype=torch.float),
-            torch.empty(shape, device=hidden_states.device, dtype=torch.int)
-            )
+        torch.empty(shape, device=hidden_states.device, dtype=torch.float),
+        torch.empty(shape, device=hidden_states.device, dtype=torch.int),
+    )
+
 
 @torch.library.register_fake("sgl_kernel::silu_and_mul_cpu")
 def _(input):
     return input.new_empty(input.shape[0], input.shape[1] // 2)
+
 
 @torch.library.register_fake("sgl_kernel::int8_scaled_mm_with_quant")
 def _(
@@ -292,6 +311,7 @@ def _(
     M = mat1.shape[0]
     N = mat2.shape[0]
     return mat1.new_empty(M, N, dtype=out_dtype)
+
 
 @torch.library.register_fake("sgl_kernel::fp8_scaled_mm_cpu")
 def _(

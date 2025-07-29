@@ -16,8 +16,6 @@
 from __future__ import annotations
 
 import logging
-import os
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -27,7 +25,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -40,8 +37,10 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+
 class GraphRunner:
-    """A GraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+    """GraphRunner is the base class for CPUGraphRunner and CudaGraphRunner, providing common methods
+    and interfaces for running the forward pass."""
 
     def __init__(self, model_runner: ModelRunner, device="cuda"):
         # Parse args
@@ -66,7 +65,6 @@ class GraphRunner:
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
-
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL

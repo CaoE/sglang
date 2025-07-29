@@ -1,15 +1,15 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
 
+import copy
 import logging
 from fractions import Fraction
 from typing import Callable, Optional, Union
 
 import torch
+import torch.utils._pytree as pytree
 from torch.nn import Parameter
 
 from sglang.srt.utils import is_cpu
-import copy
-import torch.utils._pytree as pytree
 
 __all__ = [
     "BasevLLMParameter",
@@ -73,10 +73,7 @@ class BasevLLMParameter(Parameter):
 
     @classmethod
     def __metadata_guard__(cls, orig_data, other):
-        return (
-            orig_data[0] == other[0]
-            and orig_data[1] == other[1]
-        )
+        return orig_data[0] == other[0] and orig_data[1] == other[1]
 
     def __copy__(self):
         new_param = BasevLLMParameter(data=self._data, weight_loader=self.weight_loader)
@@ -90,7 +87,7 @@ class BasevLLMParameter(Parameter):
             data=copy.deepcopy(self._data, memo), weight_loader=self.weight_loader
         )
         for k, v in self.__dict__.items():
-            if k != "_data" :
+            if k != "_data":
                 setattr(new_param, k, copy.deepcopy(v, memo))
         return new_param
 

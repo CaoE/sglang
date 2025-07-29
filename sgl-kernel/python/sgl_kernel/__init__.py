@@ -19,6 +19,7 @@ from sgl_kernel.attention import (
     merge_state,
     merge_state_v2,
 )
+from sgl_kernel.cpu_register_fake import *
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
@@ -94,7 +95,6 @@ from sgl_kernel.speculative import (
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
-from sgl_kernel.cpu_register_fake import *
 
 build_tree_kernel = (
     None  # TODO(ying): remove this after updating the sglang python code.

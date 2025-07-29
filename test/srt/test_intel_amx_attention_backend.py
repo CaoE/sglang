@@ -3,10 +3,10 @@ Usage:
 python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_mmlu
 """
 
-import unittest
-from types import SimpleNamespace
 import copy
 import os
+import unittest
+from types import SimpleNamespace
 
 from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.run_eval import run_eval

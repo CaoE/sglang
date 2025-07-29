@@ -24,6 +24,7 @@ import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
+import psutil
 import torch
 import tqdm
 
@@ -36,20 +37,16 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.patch_torch import monkey_patch_torch_compile
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    rank0_log,
-)
-import psutil
-
 from sglang.srt.model_executor.graph_runner import GraphRunner
+from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import get_available_gpu_memory, rank0_log
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 @contextmanager
 def patch_model(
@@ -58,7 +55,7 @@ def patch_model(
     num_tokens: int,
     tp_group: GroupCoordinator,
 ):
-    """Patch the model to make it compatible with with torch.compile"""
+    """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
 
     try:
@@ -81,11 +78,13 @@ def patch_model(
 
 
 def set_torch_compile_config():
+    import torch._dynamo.config
     import torch._inductor.config
 
-    torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
     torch._inductor.config.freezing = True
+    if hasattr(torch._dynamo.config, "cache_size_limit"):
+        torch._dynamo.config.cache_size_limit = 64
     monkey_patch_torch_compile()
 
 
@@ -112,14 +111,28 @@ class CPUGraphRunner(GraphRunner):
     def __init__(self, model_runner: ModelRunner):
 
         super().__init__(model_runner, device="cpu")
-        assert not self.model_runner.server_args.enable_lora, "CPUGraphRunner does not support LoRA yet."
-        assert not self.enable_two_batch_overlap, "CPUGraphRunner does not support two batch overlap yet."
-        assert not self.require_mlp_tp_gather, "CPUGraphRunner does not support MLP TP gather yet."
-        assert not self.require_mlp_sync, "CPUGraphRunner does not support MLP sync yet."
-        assert not self.require_gathered_buffer, "CPUGraphRunner does not support gathered buffer yet."
-        assert model_runner.spec_algorithm == SpeculativeAlgorithm.NONE, "CPUGraphRunner does not support speculative inference yet."
-        #TODO add compile support for encoder-decoder models
-        assert not self.is_encoder_decoder, "CPUGraphRunner does not support encoder-decoder models yet."
+        assert (
+            not self.model_runner.server_args.enable_lora
+        ), "CPUGraphRunner does not support LoRA yet."
+        assert (
+            not self.enable_two_batch_overlap
+        ), "CPUGraphRunner does not support two batch overlap yet."
+        assert (
+            not self.require_mlp_tp_gather
+        ), "CPUGraphRunner does not support MLP TP gather yet."
+        assert (
+            not self.require_mlp_sync
+        ), "CPUGraphRunner does not support MLP sync yet."
+        assert (
+            not self.require_gathered_buffer
+        ), "CPUGraphRunner does not support gathered buffer yet."
+        assert (
+            model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
+        ), "CPUGraphRunner does not support speculative inference yet."
+        # TODO add compile support for encoder-decoder models
+        assert (
+            not self.is_encoder_decoder
+        ), "CPUGraphRunner does not support encoder-decoder models yet."
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
@@ -188,10 +201,7 @@ class CPUGraphRunner(GraphRunner):
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
 
-        return (
-            is_bs_supported
-            and capture_hidden_mode_matches
-        )
+        return is_bs_supported and capture_hidden_mode_matches
 
     def capture(self) -> None:
         avail_mem = psutil.virtual_memory().available
@@ -287,7 +297,7 @@ class CPUGraphRunner(GraphRunner):
             )
             return logits_output_or_pp_proxy_tensors
 
-        with torch.no_grad(): 
+        with torch.no_grad():
             for _ in range(2):
                 self.model_runner.tp_group.barrier()
                 out = run_once()
