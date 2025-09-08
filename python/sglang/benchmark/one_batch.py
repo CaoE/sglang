@@ -798,7 +798,7 @@ def latency_test_run_once(
         )
 
     tot_latency += prefill_latency
-    throughput = input_len * batch_size / prefill_latency
+    throughput = 1 * batch_size / prefill_latency
     rank_print(
         f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
     )
