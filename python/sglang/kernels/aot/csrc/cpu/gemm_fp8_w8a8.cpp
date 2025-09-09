@@ -4,6 +4,7 @@
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
 
+
 namespace {
 
 #define BLOCK_N 32
@@ -17,7 +18,7 @@ bool cpublas_could_pack() {
     return cpublas_can_pack;
   }
 #ifdef CPUBLAS_BRGEMM_F8F8BF16
-  std::cout<<"Using F8F8 packing..."<<std::endl;
+  std::cout << "Using F8F8 packing..." << std::endl;
   cpublas_can_pack = at::native::cpublas::could_pack(at::kFloat8_e4m3fn);
 #else
   cpublas_can_pack = at::native::cpublas::could_pack(at::kBFloat16);
@@ -25,7 +26,6 @@ bool cpublas_could_pack() {
   cpublas_checked = true;
   return cpublas_can_pack;
 }
-
 
 #if defined(CPU_CAPABILITY_AVX512)
 alignas(64) static uint16_t e4m3_to_16bit[256];
@@ -48,10 +48,7 @@ static void initialize_e4m3_to_16bit_tables() {
 }
 
 template <typename T>
-static void cvt_e4m3_16bit_intrinsic_lut(
-    const at::Float8_e4m3fn* __restrict__ in,
-    T* out,
-    int64_t len) {
+static void cvt_e4m3_16bit_intrinsic_lut(const at::Float8_e4m3fn* __restrict__ in, T* out, int64_t len) {
   for (size_t i = 0; i < len; i += 64) {
     __m512i fp8_vec = _mm512_loadu_si512((__m512i*)&in[i]);
     __m128i group0 = _mm512_castsi512_si128(fp8_vec);
@@ -71,9 +68,7 @@ static void cvt_e4m3_16bit_intrinsic_lut(
     __m512i bf16_i32_vec3 = _mm512_i32gather_epi32(indices3, e4m3_to_16bit, 2);
 
     // Helper lambda: Convert 16 32-bit ints (in a __m512i) to 16 16-bit ints.
-    auto convert_32_to_16 = [](__m512i vec) -> __m256i {
-      return _mm512_cvtepi32_epi16(vec);
-    };
+    auto convert_32_to_16 = [](__m512i vec) -> __m256i { return _mm512_cvtepi32_epi16(vec); };
 
     __m256i bf16_i16_vec0 = convert_32_to_16(bf16_i32_vec0);
     __m256i bf16_i16_vec1 = convert_32_to_16(bf16_i32_vec1);
@@ -87,10 +82,7 @@ static void cvt_e4m3_16bit_intrinsic_lut(
   }
 }
 
-static void _convert_B_to_bf16(
-    const at::Float8_e4m3fn* __restrict__ B,
-    at::BFloat16* dqB,
-    int64_t len) {
+static void _convert_B_to_bf16(const at::Float8_e4m3fn* __restrict__ B, at::BFloat16* dqB, int64_t len) {
   initialize_e4m3_to_16bit_tables<at::BFloat16>();
   int tail = len % 64;
   cvt_e4m3_16bit_intrinsic_lut<at::BFloat16>(B, dqB, len - tail);
@@ -99,12 +91,8 @@ static void _convert_B_to_bf16(
   }
 }
 
-static void _convert_A_to_bf16(
-    const at::Float8_e4m3fn* __restrict__ A,
-    at::BFloat16* dqA,
-    int64_t M,
-    int64_t K,
-    int64_t lda) {
+static void
+_convert_A_to_bf16(const at::Float8_e4m3fn* __restrict__ A, at::BFloat16* dqA, int64_t M, int64_t K, int64_t lda) {
   initialize_e4m3_to_16bit_tables<at::BFloat16>();
   for (int m = 0; m < M; ++m) {
     int tail = K % 64;
@@ -125,9 +113,10 @@ static void _dequant_and_store(
     int M,
     int ldi,
     int ldo,
-    int ldsa = 1) {
+    int ldsa = 1,
+    bool is_per_tensor = false) {
   for (int m = 0; m < M; ++m) {
-    float a_scale = *(scale_a + m * ldsa);
+    float a_scale = is_per_tensor ? *scale_a : *(scale_a + m * ldsa);
     __m512 va_scale = _mm512_set1_ps(a_scale);
     int n = 0;
 #pragma GCC unroll 2
@@ -155,21 +144,14 @@ static void _dequant_and_store(
 }
 
 #else
-static void _convert_B_to_bf16(
-    const at::Float8_e4m3fn* B,
-    at::BFloat16* dqB,
-    int64_t len) {
+static void _convert_B_to_bf16(const at::Float8_e4m3fn* B, at::BFloat16* dqB, int64_t len) {
   for (int i = 0; i < len; ++i) {
     dqB[i] = (at::BFloat16)B[i];
   }
 }
 
-static void _convert_A_to_bf16(
-    const at::Float8_e4m3fn* __restrict__ A,
-    at::BFloat16* dqA,
-    int64_t M,
-    int64_t K,
-    int64_t lda) {
+static void
+_convert_A_to_bf16(const at::Float8_e4m3fn* __restrict__ A, at::BFloat16* dqA, int64_t M, int64_t K, int64_t lda) {
   for (int m = 0; m < M; ++m) {
     for (int k = 0; k < K; ++k) {
       dqA[m * K + k] = (at::BFloat16)A[m * lda + k];
@@ -188,7 +170,8 @@ void _dequant_gemm_accum(
     int64_t M,
     int64_t K,
     int64_t lda,
-    int64_t ldc) {
+    int64_t ldc,
+    bool is_per_tensor = false) {
   // Compute GEMM fp8 * fp8 -> fp32
   // Then apply scales and store results
 #ifndef CPUBLAS_BRGEMM_F8F8BF16
@@ -202,42 +185,14 @@ void _dequant_gemm_accum(
     float C_f32[M * N];
 #ifdef CPUBLAS_BRGEMM_F8F8BF16
     at::native::cpublas::brgemm(
-        M,
-        N,
-        K,
-        lda /*lda*/,
-        N /*ldb*/,
-        N /*ldc*/,
-        false /* add_C */,
-        A,
-        B,
-        C_f32,
-        true /* is_vnni */);
+        M, N, K, lda /*lda*/, N /*ldb*/, N /*ldc*/, false /* add_C */, A, B, C_f32, true /* is_vnni */);
 #else
     at::native::cpublas::brgemm(
-        M,
-        N,
-        K,
-        K /*lda*/,
-        N /*ldb*/,
-        N /*ldc*/,
-        false /* add_C */,
-        dqA,
-        dqB,
-        C_f32,
-        true /* is_vnni */);
+        M, N, K, K /*lda*/, N /*ldb*/, N /*ldc*/, false /* add_C */, dqA, dqB, C_f32, true /* is_vnni */);
 #endif
     _mm_prefetch(B + N * K, _MM_HINT_T0);
     _mm_prefetch(A + K, _MM_HINT_T0);
-    _dequant_and_store<true, N>(
-        C,
-        C_f32,
-        scales_a,
-        scales_b,
-        M,
-        N /*ldi*/,
-        ldc,
-        1 /*ldsa*/);
+    _dequant_and_store<true, N>(C, C_f32, scales_a, scales_b, M, N /*ldi*/, ldc, 1 /*ldsa*/, is_per_tensor);
   } else
 #endif
   {
@@ -251,13 +206,18 @@ void _dequant_gemm_accum(
           sum += ((float)dqA[i * K + k] * dqB[k * N + j]);
 #endif
         }
-        C[i * ldc + j] += sum * scales_a[i] * scales_b[j];
+        if (is_per_tensor) {
+          C[i * ldc + j] += sum * scales_a[0] * scales_b[j];
+
+        } else {
+          C[i * ldc + j] += sum * scales_a[i] * scales_b[j];
+        }
       }
     }
   }
 }
 
-template<int64_t N>
+template <int64_t N>
 inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
   if (bias_ptr) {
     for (int i = 0; i < m; ++i) {
@@ -273,7 +233,7 @@ inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
         y_buf[i * N + j] = bias_ptr[j];
       }
     }
-  } else { // initialize to zero
+  } else {  // initialize to zero
     for (int i = 0; i < m; ++i) {
       int j = 0;
 #if defined(CPU_CAPABILITY_AVX512)
@@ -290,7 +250,7 @@ inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
   }
 }
 
-template<typename out_dtype, int64_t N>
+template <typename out_dtype, int64_t N>
 inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_t n, */ int64_t lda) {
   for (int i = 0; i < m; ++i) {
     int j = 0;
@@ -335,7 +295,7 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
   }
 }
 
-template<typename out_dtype, bool cpublas_can_pack>
+template <typename out_dtype, bool cpublas_can_pack>
 void _float8_linear_impl(
     const at::Tensor& input,
     const at::Tensor& input_scales,
@@ -348,8 +308,10 @@ void _float8_linear_impl(
   int64_t K = input.size(-1);
   auto input_view = input.view({-1, K});
   int64_t M = input_view.size(0);
-  TORCH_CHECK(input_scales.numel() == M, "Float8 linear: unexpected input scales shape");
-
+  bool is_per_tensor = input_scales.numel() == 1;
+  if (!is_per_tensor) {
+    TORCH_CHECK(input_scales.numel() == M, "Float8 linear: unexpected input scales shape");
+  }
   // weight shape = [Nc, Kc, block_k, block_n]
   // scales shape = [Nc, G, block_n]
   int64_t Nc = weight.size(0);
@@ -378,8 +340,7 @@ void _float8_linear_impl(
   int64_t num_groups = weight_scales.size(1);
   TORCH_CHECK(K % num_groups == 0, "K should be divisible by num_groups");
   int64_t group_size = K / num_groups;
-  TORCH_CHECK(group_size % block_k == 0,
-              "Float8 linear: group_size should be divisible by block_k");
+  TORCH_CHECK(group_size % block_k == 0, "Float8 linear: group_size should be divisible by block_k");
   int64_t block_per_group = group_size / block_k;
 
   const at::Float8_e4m3fn* a_ptr = input_view.data_ptr<at::Float8_e4m3fn>();
@@ -403,22 +364,19 @@ void _float8_linear_impl(
         copy_bias<block_n>(bias_data, y_buf[0], m_size);
         for (int kci = 0; kci < Kc; ++kci) {
           _dequant_gemm_accum<cpublas_can_pack, block_n>(
-            y_buf[0] /*C*/,
-            a_ptr + mci * block_m * K + kci * block_k /*A*/,
-            a_scales_ptr + mci * block_m /*scales_a*/,
-            b_ptr + (nc * Kc + kci) * block_n * block_k /*B*/,
-            b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
-            m_size /*M*/,
-            block_k /*K*/,
-            K /*lda*/,
-            block_n /*ldc*/);
+              y_buf[0] /*C*/,
+              a_ptr + mci * block_m * K + kci * block_k /*A*/,
+              is_per_tensor ? a_scales_ptr : a_scales_ptr + mci * block_m /*scales_a*/,
+              b_ptr + (nc * Kc + kci) * block_n * block_k /*B*/,
+              b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
+              m_size /*M*/,
+              block_k /*K*/,
+              K /*lda*/,
+              block_n /*ldc*/,
+              is_per_tensor /*is_per_tensor */);
         }
         // store y_buf to output with dtype conversion
-        store_out<out_dtype, block_n>(
-          y_buf[0],
-          c_ptr + mci * block_m * N + nc * block_n,
-          m_size,
-          N /*lda*/);
+        store_out<out_dtype, block_n>(y_buf[0], c_ptr + mci * block_m * N + nc * block_n, m_size, N /*lda*/);
       }
     }
     if constexpr (cpublas_can_pack) {
@@ -427,22 +385,16 @@ void _float8_linear_impl(
   });
 }
 
-
-} // anonymous namespace
+}  // anonymous namespace
 
 /*
 return: packed_weight, packed_scales
 */
-std::tuple<at::Tensor, at::Tensor>
-float8_linear_prepack_impl(
-    const at::Tensor& weight,
-    const at::Tensor& scales) {
+std::tuple<at::Tensor, at::Tensor> float8_linear_prepack_impl(const at::Tensor& weight, const at::Tensor& scales) {
   // weight shape = [N, K]
   // scales shape = [N, G]
-  TORCH_CHECK(weight.dim() == 2,
-              "Float8 linear CPU: Weight should be a 2D tensor for packing");
-  TORCH_CHECK(weight.size(1) % 2 == 0,
-              "Float8 linear CPU: Weight should have even number of columns for packing");
+  TORCH_CHECK(weight.dim() == 2, "Float8 linear CPU: Weight should be a 2D tensor for packing");
+  TORCH_CHECK(weight.size(1) % 2 == 0, "Float8 linear CPU: Weight should have even number of columns for packing");
 
   auto new_scales = scales;
   if (new_scales.dim() == 1) {
@@ -457,8 +409,8 @@ float8_linear_prepack_impl(
   while (K % block_k != 0) {
     block_k /= 2;
   }
-  TORCH_CHECK(block_k > 0 && block_k <= group_size,
-              "Float8 linear CPU: Invalid block_k size, should be in (0, group_size]");
+  TORCH_CHECK(
+      block_k > 0 && block_k <= group_size, "Float8 linear CPU: Invalid block_k size, should be in (0, group_size]");
   constexpr int block_n = BLOCK_N;
   int Nc = N / block_n;
   int Kc = K / block_k;
@@ -473,9 +425,9 @@ float8_linear_prepack_impl(
 #if defined(CPU_CAPABILITY_AVX512)
   if (cpublas_could_pack()) {
 #ifdef CPUBLAS_BRGEMM_F8F8BF16
-    constexpr int vnni_size = 4; // for fp8
+    constexpr int vnni_size = 4;  // for fp8
 #else
-    constexpr int vnni_size = 2; // for float16
+    constexpr int vnni_size = 2;  // for float16
 #endif
     blocked_weight = at::empty({Nc, Kc, block_k, block_n}, weight.options());
     auto weight_ptr = reinterpret_cast<uint8_t*>(weight_reordered.data_ptr());
@@ -490,7 +442,7 @@ float8_linear_prepack_impl(
         // plain shape = [block_k, block_n]
         // packed shape = [block_k / VNNI_SIZE, block_n, VNNI_SIZE] viewed as [block_k, block_n]
         constexpr int n_group_size = 8;
-        constexpr int n_group = block_n / n_group_size; // 4
+        constexpr int n_group = block_n / n_group_size;  // 4
         for (int nb = 0; nb < n_group; ++nb) {
           for (int k = 0; k < block_k; k += vnni_size) {
             for (int ni = 0; ni < n_group_size; ++ni) {
@@ -526,17 +478,11 @@ at::Tensor float8_linear_impl(
   out_sizes.back() = N;
   auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
 
-#define call__float8_linear_impl(cpublas_can_pack) \
-    AT_DISPATCH_FLOATING_TYPES_AND2( \
-        at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "float8_linear_cpu", [&] { \
-          _float8_linear_impl<scalar_t, cpublas_can_pack>( \
-              input, \
-              input_scales, \
-              weight, \
-              weight_scales, \
-              bias, \
-              output); \
-        });
+#define call__float8_linear_impl(cpublas_can_pack)                                                                 \
+  AT_DISPATCH_FLOATING_TYPES_AND2(                                                                                 \
+      at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "float8_linear_cpu", [&] {                     \
+        _float8_linear_impl<scalar_t, cpublas_can_pack>(input, input_scales, weight, weight_scales, bias, output); \
+      });
 
   if (cpublas_can_pack) {
     call__float8_linear_impl(true);
