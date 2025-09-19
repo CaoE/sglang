@@ -1,4 +1,3 @@
-#include <ATen/cpu/vec/vec.h>
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
 #include <torch/all.h>
