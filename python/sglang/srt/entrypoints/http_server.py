@@ -2304,7 +2304,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                timeout=warmup_timeout if warmup_timeout > 0 else 60000,
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
