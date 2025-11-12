@@ -863,7 +863,7 @@ def latency_test_run_once(
         measurement_results["median_decode_latency"] = med_decode_latency
         measurement_results["median_decode_throughput"] = med_decode_throughput
 
-    throughput = (input_len + output_len) * batch_size / tot_latency
+    throughput = output_len * batch_size / tot_latency
     rank_print(
         f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
     )
