@@ -554,6 +554,22 @@ def register_fake_ops(tp_size: int):
 
         return output, final_state
 
+    @torch.library.register_fake("sgl_kernel::float8_linear_cpu")
+    def _(
+        input,
+        input_scales,
+        weight,
+        weight_scales,
+        bias,
+        output_dtype,
+    ):
+        in_shape = input.shape
+        if weight.dim() == 4:
+            N = weight.size(0) * weight.size(-1)
+        else:
+            N = weight.size(0)
+        return input.new_empty(*in_shape[:-1], N, dtype=output_dtype)
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.
