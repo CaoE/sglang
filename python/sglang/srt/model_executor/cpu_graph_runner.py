@@ -71,7 +71,7 @@ def patch_model(
             # tp_group.ca_comm = None
             yield torch.compile(
                 torch.no_grad()(model.forward),
-                dynamic=False,
+                dynamic=True,
             )
         else:
             yield model.forward
@@ -97,7 +97,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # cpu torch compile only speeds up decoding by
     # reducing python overhead when bs is small
     # capture_bs = list(range(1, 17))
-    capture_bs = [1, 4, 8]
+    capture_bs = [3, 4, 8, 16, 32, 64]
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
@@ -350,7 +350,7 @@ class CPUGraphRunner:
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
-        self.graphs = {}
+        self.graph = None
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -448,14 +448,12 @@ class CPUGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        is_bs_supported = (
-            forward_batch.batch_size in self.graphs
-            if self.disable_padding
-            else forward_batch.batch_size <= self.max_bs
-        )
-        print("forward_batch.batch_size: ", forward_batch.batch_size)
-        print("self.disable_padding: ", self.disable_padding)
-        print("is_bs_supported: ", is_bs_supported)
+        # is_bs_supported = (
+        #     forward_batch.batch_size in self.graphs
+        #     if self.disable_padding
+        #     else forward_batch.batch_size <= self.max_bs
+        # )
+        is_bs_supported = True
 
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
@@ -479,92 +477,99 @@ class CPUGraphRunner:
             if get_tensor_model_parallel_rank() == 0
             else reversed(self.capture_bs)
         )
+        # for bs in capture_range:
+        if get_tensor_model_parallel_rank() == 0:
+            avail_mem = psutil.virtual_memory().available / (1 << 30)
+            capture_range.set_description(
+                f"Capturing batches ({capture_range=} {avail_mem=:.2f} GB)"
+            )
+
+        with patch_model(
+            self.model_runner.model,
+            True,
+            1,
+            tp_group=self.model_runner.tp_group,
+        ) as forward:
+            (
+                graph,
+                output_buffers,
+            ) = self.capture_one_batch_size(capture_range, forward)
+            self.graph = graph
+            # self.output_buffers[bs] = output_buffers
+
+    def capture_one_batch_size(self, capture_range, forward: Callable):
         for bs in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
-                avail_mem = psutil.virtual_memory().available / (1 << 30)
-                capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+            print("bs: ", bs)
+            num_tokens = bs * self.num_tokens_per_bs
+
+            # Graph inputs
+            input_ids = self.input_ids[:num_tokens]
+            req_pool_indices = self.req_pool_indices[:bs]
+            seq_lens = self.seq_lens[:bs]
+            out_cache_loc = self.out_cache_loc[:num_tokens]
+            positions = self.positions[:num_tokens]
+            mrope_positions = self.mrope_positions[:, :bs]
+            self.num_token_non_padded[...] = num_tokens
+
+            spec_info = self.get_spec_info(num_tokens)
+            if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+                self.capture_hidden_mode = (
+                    spec_info.capture_hidden_mode
+                    if spec_info
+                    else CaptureHiddenMode.NULL
                 )
 
-            with patch_model(
-                self.model_runner.model,
-                bs in self.capture_bs,
-                num_tokens=bs * self.num_tokens_per_bs,
-                tp_group=self.model_runner.tp_group,
-            ) as forward:
-                (
-                    graph,
-                    output_buffers,
-                ) = self.capture_one_batch_size(bs, forward)
-                self.graphs[bs] = graph
-                self.output_buffers[bs] = output_buffers
-
-    def capture_one_batch_size(self, bs: int, forward: Callable):
-        num_tokens = bs * self.num_tokens_per_bs
-
-        # Graph inputs
-        input_ids = self.input_ids[:num_tokens]
-        req_pool_indices = self.req_pool_indices[:bs]
-        seq_lens = self.seq_lens[:bs]
-        out_cache_loc = self.out_cache_loc[:num_tokens]
-        positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :bs]
-        self.num_token_non_padded[...] = num_tokens
-
-        spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            forward_batch = ForwardBatch(
+                forward_mode=self.capture_forward_mode,
+                batch_size=bs,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=seq_lens.sum().item(),
+                return_logprob=False,
+                positions=positions,
+                mrope_positions=mrope_positions,
+                spec_algorithm=self.model_runner.spec_algorithm,
+                spec_info=spec_info,
+                capture_hidden_mode=self.capture_hidden_mode,
+                num_token_non_padded=self.num_token_non_padded,
+                global_forward_mode=self.capture_forward_mode,
             )
 
-        forward_batch = ForwardBatch(
-            forward_mode=self.capture_forward_mode,
-            batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
-            return_logprob=False,
-            positions=positions,
-            mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=spec_info,
-            capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=self.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
-        )
+            self.captured_forward_batches[bs] = forward_batch
+            # Attention backend
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # Do infernence to avoid setting attr at runtime, e.g.,
+            # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
+            with torch.no_grad():
+                self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
 
-        self.captured_forward_batches[bs] = forward_batch
-        # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        # Do infernence to avoid setting attr at runtime, e.g.,
-        # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
-        self.model_runner.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-        )
+            # Run and capture
+            def run_once():
+                # Clean intermediate result cache for DP attention
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
+                    None
+                )
+                logits_output_or_pp_proxy_tensors = forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
+                return logits_output_or_pp_proxy_tensors
 
-        # Run and capture
-        def run_once():
-            # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
-            return logits_output_or_pp_proxy_tensors
-
-        with torch.no_grad():
-            for _ in range(2):
-                self.model_runner.tp_group.barrier()
-                out = run_once()
-            return forward, out
+            with torch.no_grad():
+                for _ in range(2):
+                    self.model_runner.tp_group.barrier()
+                    out = run_once()
+        return forward, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -610,8 +615,8 @@ class CPUGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
-        print("bs: ", bs)
-        print("raw_bs: ", raw_bs)
+        # print("bs: ", bs)
+        # print("raw_bs: ", raw_bs)
         if bs == raw_bs:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             return forward_batch
@@ -651,27 +656,25 @@ class CPUGraphRunner:
         assert (
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
-        print("replay")
-        prepared_forward_batch = self.prepare_replay(forward_batch)
-        print("prepared_forward_batch.batch_size: ", prepared_forward_batch.batch_size)
-        output = self.graphs[prepared_forward_batch.batch_size](
-            prepared_forward_batch.input_ids,
-            prepared_forward_batch.positions,
-            prepared_forward_batch,
+        # prepared_forward_batch = self.prepare_replay(forward_batch)
+        output = self.graph(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
         )
-
-        if isinstance(output, LogitsProcessorOutput):
-            return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
-                    if output.hidden_states is not None
-                    else None
-                ),
-            )
-        else:
-            assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+        return output
+        # if isinstance(output, LogitsProcessorOutput):
+        #     return LogitsProcessorOutput(
+        #         next_token_logits=output.next_token_logits[: self.raw_num_token],
+        #         hidden_states=(
+        #             output.hidden_states[: self.raw_num_token]
+        #             if output.hidden_states is not None
+        #             else None
+        #         ),
+        #     )
+        # else:
+        #     assert isinstance(output, PPProxyTensors)
+        #     return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
