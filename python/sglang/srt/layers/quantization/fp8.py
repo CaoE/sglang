@@ -239,74 +239,25 @@ def _quantize_fp8e4m3(
         scale_reshape = scale.reshape((-1,) + (1,) * (t.dim() - 1))
         qt = t / scale_reshape
     else:
-        scale = scale or t.abs().max().reshape([1]) / quant_max
-        scale = (
-            torch.max(scale, eps)
-            if isinstance(scale, torch.Tensor)
-            else max(scale, eps.item())
-        )
-        qt = t / scale
+        if scale is None:
+            scale = t.abs().max().reshape([1]) / quant_max
+            scale = (
+                torch.max(scale, eps)
+                if isinstance(scale, torch.Tensor)
+                else max(scale, eps.item())
+            )
+            qt = t / scale
+        else:
+            scale = (
+                torch.max(scale, eps)
+                if isinstance(scale, torch.Tensor)
+                else max(scale, eps.item())
+            )
+            qt = t.to(torch.float32) / scale
+            qt = torch.clamp(qt, min=-quant_max, max=quant_max)
     qt = qt.to(torch.float8_e4m3fn)
     return qt, scale
 
-
-def _expand_scale_to_tensor_shape(
-    scale: torch.Tensor, target_shape: torch.Size
-) -> torch.Tensor:
-    if scale.shape == target_shape:
-        # Scale already matches target shape
-        return scale
-
-    if scale.numel() == 1:
-        # Scalar scale - can broadcast naturally
-        return scale
-
-    # Calculate block sizes from shape difference
-    if len(scale.shape) != len(target_shape):
-        raise ValueError(
-            f"Scale tensor has {len(scale.shape)} dimensions but target has {len(target_shape)}"
-        )
-
-    block_sizes = tuple(
-        target_shape[i] // scale.shape[i] for i in range(len(target_shape))
-    )
-
-    # Verify that target_shape is evenly divisible by scale.shape
-    for i, (target_dim, scale_dim, block_size) in enumerate(
-        zip(target_shape, scale.shape, block_sizes)
-    ):
-        if target_dim != scale_dim * block_size:
-            raise ValueError(
-                f"Dimension {i}: target size {target_dim} is not evenly divisible "
-                f"by scale size {scale_dim} (block size would be {target_dim / scale_dim})"
-            )
-
-    # Expand scale using repeat_interleave
-    expanded_scale = scale
-    for i, block_size in enumerate(block_sizes):
-        if block_size > 1:
-            expanded_scale = expanded_scale.repeat_interleave(block_size, dim=i)
-
-    return expanded_scale
-
-
-def _quantize_affine_float8(
-    tensor: torch.Tensor,
-    scale: torch.Tensor,
-    float8_dtype: torch.dtype = torch.float8_e4m3fn,
-    cast_to_float8_dtype: bool = True,
-) -> torch.Tensor:
-    tensor_fp32 = tensor.to(torch.float32)
-
-    # Expand scale to match tensor dimensions for block-wise quantization
-    scale_expanded = _expand_scale_to_tensor_shape(scale, tensor.shape)
-
-    tensor_scaled = tensor_fp32 / scale_expanded
-    max_value = torch.finfo(float8_dtype).max
-    tensor_clamped = tensor_scaled.clamp(min=-max_value, max=max_value)
-    if cast_to_float8_dtype:
-        tensor_clamped = tensor_clamped.to(float8_dtype)
-    return tensor_clamped
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
@@ -1240,15 +1191,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if self.quant_config.activation_scheme == "static":
-            q_input = _quantize_affine_float8(
-                tensor=x,
-                scale=layer.input_scale,
-                float8_dtype=torch.float8_e4m3fn
-            )
+            q_input, scale = _quantize_fp8e4m3(x, False, layer.input_scale)
+
             if SGLANG_LLAMA_BRGEMM_FP8A8:
                 return torch.ops.sgl_kernel.float8_linear_cpu(
                     q_input,
-                    layer.input_scale,
+                    scale,
                     layer.weight,
                     layer.weight_scale,
                     bias,
