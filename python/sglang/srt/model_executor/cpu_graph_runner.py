@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from torch._dynamo import mark_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ def patch_model(
             # tp_group.ca_comm = None
             yield torch.compile(
                 torch.no_grad()(model.forward),
-                dynamic=False,
+                dynamic=True,
             )
         else:
             yield model.forward
@@ -94,7 +95,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     # cpu torch compile only speeds up decoding by
     # reducing python overhead when bs is small
-    capture_bs = list(range(1, 17))
+    # capture_bs = list(range(1, 17))
+    capture_bs = [1, 2, 3, 97, 98, 99]
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
@@ -367,7 +369,8 @@ class CPUGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
 
-        self.capture_forward_mode = ForwardMode.DECODE
+        # self.capture_forward_mode = ForwardMode.DECODE
+        self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
 
@@ -460,6 +463,8 @@ class CPUGraphRunner:
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
 
+        print("is_bs_supported: ", is_bs_supported)
+        print("capture_hidden_mode_matches: ", capture_hidden_mode_matches)
         return is_bs_supported and capture_hidden_mode_matches
 
     def capture(self) -> None:
@@ -497,7 +502,8 @@ class CPUGraphRunner:
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :bs]
+        # mrope_positions = self.mrope_positions[:, :bs]
+        mrope_positions = None
         self.num_token_non_padded[...] = num_tokens
 
         spec_info = self.get_spec_info(num_tokens)
@@ -505,6 +511,12 @@ class CPUGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
+
+        mark_dynamic(input_ids, 0)
+        mark_dynamic(positions, 0)
+        mark_dynamic(out_cache_loc, 0)
+
+        
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -518,6 +530,19 @@ class CPUGraphRunner:
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
+            extend_num_tokens=num_tokens,
+            # extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+            extend_seq_lens=torch.zeros((num_tokens,), dtype=torch.int32),
+            # extend_prefix_lens=torch.tensor([num_tokens], dtype=torch.int32),
+            extend_prefix_lens=torch.zeros((num_tokens,), dtype=torch.int32),
+            # extend_start_loc=torch.tensor([0], dtype=torch.int32),
+            extend_start_loc=torch.zeros((num_tokens,), dtype=torch.int32),
+            # extend_prefix_lens_cpu=torch.tensor([num_tokens]),
+            extend_prefix_lens_cpu=list(torch.zeros((num_tokens,)),),
+            # extend_seq_lens_cpu=torch.tensor([num_tokens]),
+            extend_seq_lens_cpu=list(torch.zeros((num_tokens,)),),
+            # extend_logprob_start_lens_cpu=torch.tensor([num_tokens]),
+            extend_logprob_start_lens_cpu=list(torch.zeros((num_tokens,)),),
             positions=positions,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -526,7 +551,12 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
+        print("seq_lens shape[0]: ", forward_batch.seq_lens.shape[0])
+        print("extend_seq_lens shape[0]: ", forward_batch.extend_seq_lens.shape[0])
 
+        kwargs = {}
+        if not self.model_runner.is_generation:
+            kwargs["get_embedding"] = True
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Do infernence to avoid setting attr at runtime, e.g.,
@@ -535,6 +565,7 @@ class CPUGraphRunner:
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
+            **kwargs,
         )
 
         # Run and capture
@@ -592,6 +623,10 @@ class CPUGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        kwargs = {}
+        if not self.model_runner.is_generation:
+            kwargs["get_embedding"] = True
+        print("repaly")
         assert (
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
@@ -601,6 +636,7 @@ class CPUGraphRunner:
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
+            **kwargs,
         )
         return output
 

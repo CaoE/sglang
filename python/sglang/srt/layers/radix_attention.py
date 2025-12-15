@@ -110,6 +110,8 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
+        # print("forward_mode id:", id(forward_batch.forward_mode))
+        # print("forward_batch.forward_mode(): ", forward_batch.forward_mode)
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))

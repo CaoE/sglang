@@ -2420,9 +2420,11 @@ class ModelRunner:
         self.graph_runner = None
         self.graph_mem_usage = 0
 
-        if not self.is_generation:
-            # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
-            return
+        # return
+        # print("self.is_generation: ", self.is_generation)
+        # if not self.is_generation:
+        #     # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
+        #     return
 
         if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
             return
@@ -2673,6 +2675,15 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        print("forward_batch: ", forward_batch)
+        print("forward input id shape: ", forward_batch.input_ids.shape)
+        print("fowward seq_lens: ", forward_batch.seq_lens)
+        print("fowward seq_lens shape: ", forward_batch.seq_lens.shape)
+        print("forward extend_prefix_lens : ", forward_batch.extend_prefix_lens)
+        print("forward extend_prefix_lens shape: ", forward_batch.extend_prefix_lens.shape)
+        print("forward positions shape: ", forward_batch.positions.shape)
+        print("forward req_pool_indices shape: ", forward_batch.req_pool_indices.shape)
+        
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
