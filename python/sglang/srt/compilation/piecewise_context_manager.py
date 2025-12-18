@@ -50,12 +50,14 @@ def get_forward_context() -> Optional[ForwardContext]:
 def set_forward_context(
     forward_batch: ForwardBatch, attention_layers: List[Any], quant_config: Any
 ):
+    print("out set_forward_context---------------------------------")
     global _forward_context
     _forward_context = ForwardContext()
     _forward_context.set_forward_batch(forward_batch)
     _forward_context.set_attention_layers(attention_layers)
     _forward_context.set_quant_config(quant_config)
     try:
+        print("----------------------set_forward_context------------------")
         yield
     finally:
         _forward_context = None

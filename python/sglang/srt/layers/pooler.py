@@ -45,6 +45,8 @@ class Pooler(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> EmbeddingPoolerOutput:
 
+        # print("hidden_states shape: ", hidden_states.shape, flush=True)
+        # print("forward_batch.extend_seq_lens: ", forward_batch.extend_seq_lens, flush=True)
         if self.pooling_type == PoolingType.LAST:
             last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             pooled_data = hidden_states[last_token_indices]
