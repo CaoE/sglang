@@ -70,7 +70,6 @@ def set_forward_context(
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
     """
-    assert False
     global forward_start_time
     need_to_track_batchsize = track_batchsize and attn_metadata is not None
     if need_to_track_batchsize:

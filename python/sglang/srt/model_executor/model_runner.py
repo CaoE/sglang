@@ -2724,7 +2724,7 @@ class ModelRunner:
         )
 
         if can_run_graph:
-            dump_forward_batch(forward_batch)
+            # dump_forward_batch(forward_batch)
             # print("--------------------------------------------------------", flush=True)
             # forward_batch.sampling_info=None
             # dump_forward_batch(forward_batch)
