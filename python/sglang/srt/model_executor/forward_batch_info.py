@@ -162,7 +162,7 @@ class ForwardMode(IntEnum):
         )
 
     def is_cpu_graph(self):
-        return self == ForwardMode.EXTEND # self == ForwardMode.DECODE or 
+        return self == ForwardMode.DECODE or self == ForwardMode.EXTEND
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL

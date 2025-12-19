@@ -162,20 +162,20 @@ class Qwen3Attention(nn.Module):
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # q, k = self._apply_qk_norm(q, k)
 
-        # batch_dims = qkv.shape[:-1]
-        # qkv_view = qkv.view(*batch_dims, -1, self.head_dim)
-        # q_view = qkv_view[..., :self.num_heads, :]
-        # k_view = qkv_view[..., self.num_heads:self.num_heads + self.num_kv_heads, :]
-        # v_view = qkv_view[..., self.num_heads + self.num_kv_heads:, :]
-        # q_by_head = self.q_norm(q_view.reshape(-1, self.head_dim))
-        # k_by_head = self.k_norm(k_view.reshape(-1, self.head_dim))
-        # q = q_by_head.view(*batch_dims, self.q_size)
-        # k = k_by_head.view(*batch_dims, self.kv_size)
-        # v = v_view.view(*batch_dims, self.kv_size)
+        batch_dims = qkv.shape[:-1]
+        qkv_view = qkv.view(*batch_dims, -1, self.head_dim)
+        q_view = qkv_view[..., :self.num_heads, :]
+        k_view = qkv_view[..., self.num_heads:self.num_heads + self.num_kv_heads, :]
+        v_view = qkv_view[..., self.num_heads + self.num_kv_heads:, :]
+        q_by_head = self.q_norm(q_view.reshape(-1, self.head_dim))
+        k_by_head = self.k_norm(k_view.reshape(-1, self.head_dim))
+        q = q_by_head.view(*batch_dims, self.q_size)
+        k = k_by_head.view(*batch_dims, self.kv_size)
+        v = v_view.view(*batch_dims, self.kv_size)
 
-        q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
