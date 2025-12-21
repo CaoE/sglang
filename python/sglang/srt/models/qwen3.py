@@ -166,7 +166,7 @@ class Qwen3Attention(nn.Module):
         if is_cpu:
             # Performing view operations first and then slice ensures that
             # the last dimension is continuous, allowing torch.compile to
-            # generatevectorized kernels as much as possible.
+            # generate vectorized kernels as much as possible.
             batch_dims = qkv.shape[:-1]
             qkv_view = qkv.view(*batch_dims, -1, self.head_dim)
             q_view = qkv_view[..., :self.num_heads, :]
