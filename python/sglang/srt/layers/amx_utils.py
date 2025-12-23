@@ -16,6 +16,7 @@ class CPUQuantMethod(IntEnum):
     FP8_W8A16 = 2
     INT4_W4A8 = 3
     MXFP4 = 4
+    FP8_W8A8 = 5
 
 
 class CPUQuantAlgo(IntEnum):
