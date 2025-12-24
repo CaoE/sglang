@@ -594,7 +594,7 @@ def register_fake_ops(tp_size: int):
         input_scales,
     ):
         M = input.shape[0]
-        K = input.shape[0]
+        K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
         scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
         return act_quant, scale
@@ -606,7 +606,7 @@ def register_fake_ops(tp_size: int):
         input_scales,
     ):
         M = input.shape[0]
-        K = input.shape[0]
+        K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
         scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
         return act_quant, scale
