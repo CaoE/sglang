@@ -303,8 +303,8 @@ void _float8_linear_impl(
   // weight shape = [Nc, Kc, block_k, block_n]
   // scales shape = [Nc, G, block_n]
   int64_t Nc = weight.size(0);
-  int64_t Kc = wei_quant_mode == PER_TENSOR ? 1 : weight.size(1);
-  int64_t block_k = wei_quant_mode == PER_TENSOR ? weight.size(1) * weight.size(2) : weight.size(2);
+  int64_t Kc = wei_quant_mode != PER_GROUP ? 1 : weight.size(1);
+  int64_t block_k = wei_quant_mode != PER_GROUP ? weight.size(1) * weight.size(2) : weight.size(2);
   constexpr int64_t block_n = BLOCK_N;
   TORCH_CHECK(weight.size(3) == block_n, "Float8 linear: unexpected weight shape");
   int64_t N = Nc * block_n;
