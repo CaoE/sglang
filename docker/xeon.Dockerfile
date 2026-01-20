@@ -33,8 +33,22 @@ RUN echo -e '[[index]]\nname = "torch"\nurl = "https://download.pytorch.org/whl/
 ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
 
 WORKDIR /sgl-workspace
-RUN source /opt/.venv/bin/activate && \
-    git clone ${SGLANG_REPO} sglang && \
+
+RUN curl -fsSL -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.3.1-0/Miniforge3-25.3.1-0-Linux-x86_64.sh && \
+    bash miniforge.sh -b -p ./miniforge3 && \
+    rm -f miniforge.sh && \
+    . miniforge3/bin/activate && \
+    conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl && \
+    conda install --update-deps -c conda-forge -y gxx gcc sysroot_linux-64
+
+ENV PATH=/sgl-workspace/miniforge3/bin:/sgl-workspace/miniforge3/condabin:${PATH}
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV CONDA_PREFIX=/sgl-workspace/miniforge3
+
+RUN pip config set global.index-url https://download.pytorch.org/whl/cpu && \
+    pip config set global.extra-index-url https://pypi.org/simple
+
+RUN git clone ${SGLANG_REPO} sglang && \
     cd sglang && \
     git checkout ${VER_SGLANG} && \
     cd python && \
