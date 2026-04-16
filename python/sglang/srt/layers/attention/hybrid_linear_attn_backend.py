@@ -390,9 +390,11 @@ class MambaAttnBackendBase(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        is_prefill=False,
     ):
         self.forward_metadata = self._capture_metadata(
             bs, req_pool_indices, forward_mode, spec_info
@@ -771,9 +773,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        is_prefill=False,
     ):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_capture_cpu_graph(
@@ -781,9 +785,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 num_tokens,
                 req_pool_indices,
                 seq_lens,
+                extend_seq_lens,
                 encoder_lens,
                 forward_mode,
                 spec_info,
+                is_prefill,
             )
 
     def init_forward_metadata_replay_cuda_graph(

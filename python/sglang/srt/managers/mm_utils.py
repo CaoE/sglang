@@ -904,6 +904,7 @@ def get_embedding_and_mask(
     return embedding, special_multimodal_mask, input_ids
 
 
+@torch.compiler.disable
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],

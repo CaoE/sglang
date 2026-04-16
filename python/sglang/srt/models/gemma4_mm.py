@@ -238,6 +238,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
 
+        # Cache the embedding funcs dict so bound methods are not
+        # re-created on every forward call (avoids torch.compile guard
+        # failures due to deallocated objects).
+        self._data_embedding_funcs = {
+            Modality.IMAGE: self.get_image_feature,
+            Modality.VIDEO: self.get_video_feature,
+            Modality.AUDIO: self.get_audio_feature,
+        }
+
         self.post_init()
 
     def pad_input_ids(
@@ -272,10 +281,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
         if not isinstance(forward_batch.attn_backend, TritonAttnBackend):
-            logger.warning_once(
-                "Bidirectional attention for image tokens requires TritonAttnBackend. "
-                "Falling back to causal attention, which may degrade image quality."
-            )
+            # logger.warning_once(
+            #     "Bidirectional attention for image tokens requires TritonAttnBackend. "
+            #     "Falling back to causal attention, which may degrade image quality."
+            # )
             return
         assert forward_batch.forward_mode == ForwardMode.EXTEND
 
@@ -575,11 +584,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
-                Modality.VIDEO: self.get_video_feature,
-                Modality.AUDIO: self.get_audio_feature,
-            },
+            data_embedding_funcs=self._data_embedding_funcs,
             positions=positions,
             per_layer_inputs=per_layer_inputs,
             **kwargs,

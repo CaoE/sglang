@@ -235,7 +235,7 @@ class Gemma4VisionAttention(nn.Module):
         if _is_cpu and _cpu_has_amx_support:
             cos = cos.reshape(bsz * seq_len, self.head_dim)
             sin = sin.reshape(bsz * seq_len, self.head_dim)
-            q, k = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(q, k, cos, sin)
+            torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(q, k, cos, sin)
         else:
             cos_flat = cos.reshape(bsz * seq_len, 1, self.head_dim)
             sin_flat = sin.reshape(bsz * seq_len, 1, self.head_dim)

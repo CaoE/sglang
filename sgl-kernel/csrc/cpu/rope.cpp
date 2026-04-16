@@ -761,8 +761,8 @@ void apply_multidimensional_rope_kernel_impl(
 // sin:   [num_tokens, head_dim]
 // Applies 2-D multidimensional RoPE: splits head_dim into 2 chunks and applies
 // standard rotary embedding to each independently (in-place on query and key).
-std::tuple<at::Tensor, at::Tensor>
-apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
+// std::tuple<at::Tensor, at::Tensor>
+void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
   RECORD_FUNCTION("sgl-kernel::apply_multidimensional_rope_cpu", std::vector<c10::IValue>({query, key}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
@@ -819,7 +819,7 @@ apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& 
         head_dim,
         num_tokens);
   });
-  return std::make_tuple(query, key);
+  // return std::make_tuple(query, key);
 }
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(

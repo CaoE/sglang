@@ -336,7 +336,7 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         max_num_reqs,                                                                      \
         max_context_len,                                                                   \
         max_total_num_tokens,                                                              \
-        max_len_extend,                                                                    \
+        max_len_extend_value,                                                              \
         sz,                                                                                \
         sliding_window_size,                                                               \
         is_prefix_skipped,                                                                 \
@@ -373,7 +373,7 @@ void extend_attention_cpu(
     at::Tensor& seq_lens,
     at::Tensor& extend_seq_lens,
     at::Tensor& extend_start_loc,
-    int64_t max_len_extend,
+    at::Tensor& max_len_extend,
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
@@ -411,6 +411,8 @@ void extend_attention_cpu(
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_extend);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+
+  int64_t max_len_extend_value = max_len_extend.item<int64_t>();
 
   int num_seqs = seq_lens.size(0);
   int max_num_reqs = req_to_token.size(0);
@@ -482,13 +484,13 @@ void extend_attention_cpu(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
-      if (max_len_extend <= 256) {
+      if (max_len_extend_value <= 256) {
         LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
-      } else if (max_len_extend <= 1024) {
+      } else if (max_len_extend_value <= 1024) {
         LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
-      } else if (max_len_extend <= 4096) {
+      } else if (max_len_extend_value <= 4096) {
         LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
-      } else {  // max_len_extend > 4096
+      } else {  // max_len_extend_value > 4096
         LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
       }
     });

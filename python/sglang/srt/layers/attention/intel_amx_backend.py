@@ -54,7 +54,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             max_extend_len = None
         else:
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            max_extend_len = torch.max(forward_batch.extend_seq_lens)
         self.forward_metadata = (attn_logits, max_extend_len)
 
     def get_cpu_graph_seq_len_fill_value(self):
@@ -66,9 +66,11 @@ class IntelAMXAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens,
+        extend_seq_lens: torch.Tensor,
+        encoder_lens: torch.Tensor,
         forward_mode,
         spec_info,
+        is_prefill=False,
     ):
         attn_logits = torch.zeros(
             (
@@ -80,7 +82,10 @@ class IntelAMXAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        max_extend_len = None
+        if is_prefill:
+            max_extend_len = torch.max(extend_seq_lens)
+        else:
+            max_extend_len = None
         self.forward_metadata = (attn_logits, max_extend_len)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):

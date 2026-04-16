@@ -435,14 +435,22 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& v,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k,
-    int64_t max_seqlen_q,
-    int64_t max_seqlen_k,
+    const at::Tensor& max_seqlen_q,
+    const at::Tensor& max_seqlen_k,
     bool causal,
     std::optional<double> scale) {
   RECORD_FUNCTION(
       "sgl_kernel::flash_attn_varlen_func",
-      std::vector<c10::IValue>({q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
-                                scale.has_value() ? c10::IValue(scale.value()) : c10::IValue()}));
+      std::vector<c10::IValue>(
+          {q,
+           k,
+           v,
+           cu_seqlens_q,
+           cu_seqlens_k,
+           max_seqlen_q,
+           max_seqlen_k,
+           causal,
+           scale.has_value() ? c10::IValue(scale.value()) : c10::IValue()}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
@@ -454,6 +462,9 @@ at::Tensor flash_attn_varlen_func(
   CHECK_INPUT(cu_seqlens_k);
   CHECK_EQ(cu_seqlens_q.scalar_type(), at::kInt);
   CHECK_EQ(cu_seqlens_k.scalar_type(), at::kInt);
+
+  int64_t max_seqlen_q_value = max_seqlen_q.item<int64_t>();
+  int64_t max_seqlen_k_value = max_seqlen_k.item<int64_t>();
 
   int num_seqs = cu_seqlens_q.size(0) - 1;
   int num_tokens = q.size(0);
@@ -484,7 +495,7 @@ at::Tensor flash_attn_varlen_func(
 
   // check whether the batch has variant lengths
   const bool is_varlen =
-      has_varlen_sequences<int32_t>(cu_seqlens_q, cu_seqlens_k, num_seqs, max_seqlen_q, max_seqlen_k);
+      has_varlen_sequences<int32_t>(cu_seqlens_q, cu_seqlens_k, num_seqs, max_seqlen_q_value, max_seqlen_k_value);
 
   int num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({}, q.options().dtype(at::kChar));
@@ -499,7 +510,7 @@ at::Tensor flash_attn_varlen_func(
     int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v);
 
     if (is_varlen) {
-      resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);
+      resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q_value);
       flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
           out.data_ptr<scalar_t>(),
           q.data_ptr<scalar_t>(),
@@ -509,8 +520,8 @@ at::Tensor flash_attn_varlen_func(
           cu_seqlens_k.data_ptr<int32_t>(),
           buffer.data_ptr(),
           indices.data_ptr<int32_t>(),
-          max_seqlen_q,
-          max_seqlen_k,
+          max_seqlen_q_value,
+          max_seqlen_k_value,
           num_seqs,
           num_heads,
           num_heads_kv,
@@ -532,8 +543,8 @@ at::Tensor flash_attn_varlen_func(
           k.data_ptr<scalar_t>(),
           v.data_ptr<scalar_t>(),
           buffer.data_ptr(),
-          max_seqlen_q,
-          max_seqlen_k,
+          max_seqlen_q_value,
+          max_seqlen_k_value,
           num_seqs,
           num_heads,
           num_heads_kv,

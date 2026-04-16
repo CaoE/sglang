@@ -116,7 +116,7 @@ void extend_attention_cpu(
     at::Tensor& seq_lens,
     at::Tensor& extend_seq_lens,
     at::Tensor& extend_start_loc,
-    int64_t max_len_extend,
+    at::Tensor& max_len_extend,
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
@@ -131,8 +131,8 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& v,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k,
-    int64_t max_seqlen_q,
-    int64_t max_seqlen_k,
+    const at::Tensor& max_seqlen_q,
+    const at::Tensor& max_seqlen_k,
     bool causal,
     std::optional<double> scale);
 
@@ -344,8 +344,8 @@ std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // multidimensional rope
-std::tuple<at::Tensor, at::Tensor>
-apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+// std::tuple<at::Tensor, at::Tensor>
+void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // mrope
 std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
@@ -474,7 +474,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
+      "extend_start_loc, Tensor max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
       "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
@@ -482,7 +482,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // flash attn
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal, float? scale=None) -> Tensor");
+      "Tensor max_seqlen_q, Tensor max_seqlen_k, bool causal, float? scale=None) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
 
   // linear attn
@@ -618,7 +618,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multidimensional rope
-  m.def("apply_multidimensional_rope_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> (Tensor(a!), Tensor(b!))");
+  m.def("apply_multidimensional_rope_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> ()");
   m.impl("apply_multidimensional_rope_cpu", torch::kCPU, &apply_multidimensional_rope_cpu);
 
   // multimodal rope

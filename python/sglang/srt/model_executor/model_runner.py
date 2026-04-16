@@ -2385,7 +2385,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_runner = None
         self.graph_mem_usage = 0
 
-        if not self.is_generation:
+        if not self.is_generation and self.device != "cpu":
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
