@@ -2619,6 +2619,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale_inv,  # w2_scale
                     None,  # w1_zp
                     None,  # w2_zp
+                    None,  # a1_scale
                     self.quant_config.weight_block_size,  # block_size
                     None,  # w1 bias
                     None,  # w3 bias
@@ -2641,6 +2642,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale_inv,  # w2_scale
                     None,  # w1_zp
                     None,  # w2_zp
+                    x_s,  # a1_scale
                     self.quant_config.weight_block_size,  # block_size
                     None,  # w1 bias
                     None,  # w3 bias

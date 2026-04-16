@@ -868,6 +868,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 None,  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
+                None,  # a1_scale
                 None,  # block_size
                 getattr(layer, "w13_weight_bias", None),
                 getattr(layer, "w2_weight_bias", None),

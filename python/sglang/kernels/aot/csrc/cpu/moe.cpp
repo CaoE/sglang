@@ -883,6 +883,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
+    const std::optional<at::Tensor>& a1_scale,
     const std::optional<std::vector<int64_t>> block_size,
     const std::optional<at::Tensor>& w1_bias,
     const std::optional<at::Tensor>& w2_bias,
@@ -1179,7 +1180,7 @@ at::Tensor fused_experts_cpu(
           hidden_states.data_ptr<at::Float8_e4m3fn>(),
           packed_w1.data_ptr<at::Float8_e4m3fn>(),
           packed_w2.data_ptr<at::Float8_e4m3fn>(),
-          nullptr,  // a1_scale - TODO: pass through API
+          a1_scale.has_value() ? a1_scale.value().data_ptr<float>() : nullptr,
           w1s.data_ptr<float>(),
           w2s.data_ptr<float>(),
           block_size_N,
