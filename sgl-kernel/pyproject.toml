@@ -1,25 +1,21 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch>=2.8.0",
+  "torch==2.9.0",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "sgl-kernel"
+name = "sgl-kernel-cpu"
 version = "0.3.21"
-authors = [
-  { name="Yineng Zhang", email="me@zhyncs.com" },
-]
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: Apache Software License",
-  "Environment :: GPU :: NVIDIA CUDA"
+  "License :: OSI Approved :: Apache Software License"
 ]
 dependencies = []
 
@@ -34,9 +30,7 @@ exclude = [
 ]
 
 [tool.scikit-build]
+cmake.source-dir = "csrc/cpu"
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
-
-wheel.py-api = "cp310"
-wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]

@@ -473,6 +473,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    # Use optimized CPU MHC kernels (mhc_cpu.py) when running on CPU engine.
+    # Set to False to fall back to the inline torch fallback in deepseek_v4.py.
+    SGLANG_OPT_USE_CPU_MHC_KERNEL = EnvBool(True)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)

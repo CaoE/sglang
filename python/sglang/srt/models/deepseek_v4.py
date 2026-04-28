@@ -63,7 +63,13 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_v2 import (
+    ParallelLMHead,
+    _is_cpu,
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -1010,6 +1016,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb
 
+        if _is_cpu and envs.SGLANG_OPT_USE_CPU_MHC_KERNEL.get():
+            from sglang.srt.layers.mhc_cpu import hc_pre_cpu
+
+            return hc_pre_cpu(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
@@ -1068,6 +1088,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
+
+        if _is_cpu and envs.SGLANG_OPT_USE_CPU_MHC_KERNEL.get():
+            from sglang.srt.layers.mhc_cpu import hc_post_cpu
+
+            return hc_post_cpu(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
