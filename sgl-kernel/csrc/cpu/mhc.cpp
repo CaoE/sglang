@@ -150,9 +150,7 @@ static void hc_pre_scale_impl(
     int64_t T,
     int64_t hc_d,
     float rms_eps) {
-  static_assert(
-      std::is_same_v<scalar_t, float> || std::is_same_v<scalar_t, c10::BFloat16>,
-      "hc_pre_scale_impl: only float32 and bf16 are supported");
+  static_assert(std::is_same_v<scalar_t, c10::BFloat16>, "hc_pre_scale_impl: only bf16 is supported");
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
@@ -165,28 +163,16 @@ static void hc_pre_scale_impl(
       fVec sq_acc(0.f);
       int64_t k;
 
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        // float32: bVec::size() == fVec::size() (typically 16)
-        for (k = 0; k <= hc_d - kVecSize; k += kVecSize) {
-          fVec xv = fVec::loadu(x_t + k);
-          sq_acc += xv * xv;
-        }
-        if (k < hc_d) {
-          fVec xv = fVec::loadu(x_t + k, hc_d - k);
-          sq_acc += xv * xv;
-        }
-      } else {
-        // bf16/fp16: bVec::size() == 2 * fVec::size(), convert_to_float splits into two
-        for (k = 0; k <= hc_d - kVecSize; k += kVecSize) {
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          sq_acc += x0 * x0 + x1 * x1;
-        }
-        if (k < hc_d) {
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, hc_d - k));
-          sq_acc += x0 * x0 + x1 * x1;
-        }
+      // bf16: bVec::size() == 2 * fVec::size(), convert_to_float splits into two
+      for (k = 0; k <= hc_d - kVecSize; k += kVecSize) {
+        fVec x0, x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        sq_acc += x0 * x0 + x1 * x1;
+      }
+      if (k < hc_d) {
+        fVec x0, x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, hc_d - k));
+        sq_acc += x0 * x0 + x1 * x1;
       }
 
       const double sum_sq = static_cast<double>(vec_reduce_sum(sq_acc));
@@ -194,30 +180,21 @@ static void hc_pre_scale_impl(
           static_cast<float>(1.0 / std::sqrt(sum_sq / static_cast<double>(hc_d) + static_cast<double>(rms_eps)));
       const fVec rsqrt_fvec(rsqrt);
 
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        // float32: direct store
-        for (k = 0; k <= hc_d - kVecSize; k += kVecSize) {
-          fVec xv = fVec::loadu(x_t + k);
-          (xv * rsqrt_fvec).store(sx_t + k);
-        }
-        if (k < hc_d) (fVec::loadu(x_t + k, hc_d - k) * rsqrt_fvec).store(sx_t + k, hc_d - k);
-      } else {
-        // bf16/fp16: convert and store to float32 output
-        for (k = 0; k <= hc_d - kVecSize; k += kVecSize) {
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          (x0 * rsqrt_fvec).store(sx_t + k);
-          (x1 * rsqrt_fvec).store(sx_t + k + fVec::size());
-        }
-        if (k < hc_d) {
-          const int64_t rem = hc_d - k;
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-          const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-          const int64_t rem1 = rem - rem0;
-          (x0 * rsqrt_fvec).store(sx_t + k, rem0);
-          if (rem1 > 0) (x1 * rsqrt_fvec).store(sx_t + k + fVec::size(), rem1);
-        }
+      // bf16: convert and store to float32 output
+      for (k = 0; k <= hc_d - kVecSize; k += kVecSize) {
+        fVec x0, x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        (x0 * rsqrt_fvec).store(sx_t + k);
+        (x1 * rsqrt_fvec).store(sx_t + k + fVec::size());
+      }
+      if (k < hc_d) {
+        const int64_t rem = hc_d - k;
+        fVec x0, x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
+        const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+        const int64_t rem1 = rem - rem0;
+        (x0 * rsqrt_fvec).store(sx_t + k, rem0);
+        if (rem1 > 0) (x1 * rsqrt_fvec).store(sx_t + k + fVec::size(), rem1);
       }
     }
   });
@@ -241,9 +218,7 @@ static void hc_pre_scale_splitk_impl(
     int64_t T,
     int64_t hc_d,
     float rms_eps) {
-  static_assert(
-      std::is_same_v<scalar_t, float> || std::is_same_v<scalar_t, c10::BFloat16>,
-      "hc_pre_scale_splitk_impl: only float32 and bf16 are supported");
+  static_assert(std::is_same_v<scalar_t, c10::BFloat16>, "hc_pre_scale_splitk_impl: only bf16 is supported");
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int64_t kVecSize = bVec::size();
@@ -267,26 +242,15 @@ static void hc_pre_scale_splitk_impl(
 
       fVec sq_acc(0.f);
       int64_t k;
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        for (k = k0; k <= k1 - (int64_t)fVec::size(); k += fVec::size()) {
-          fVec xv = fVec::loadu(x_t + k);
-          sq_acc += xv * xv;
-        }
-        if (k < k1) {
-          fVec xv = fVec::loadu(x_t + k, k1 - k);
-          sq_acc += xv * xv;
-        }
-      } else {
-        for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
-          fVec x0v, x1v;
-          std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          sq_acc += x0v * x0v + x1v * x1v;
-        }
-        if (k < k1) {
-          fVec x0v, x1v;
-          std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k, k1 - k));
-          sq_acc += x0v * x0v + x1v * x1v;
-        }
+      for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
+        fVec x0v, x1v;
+        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        sq_acc += x0v * x0v + x1v * x1v;
+      }
+      if (k < k1) {
+        fVec x0v, x1v;
+        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k, k1 - k));
+        sq_acc += x0v * x0v + x1v * x1v;
       }
       partial_sq[static_cast<size_t>(idx)] = static_cast<double>(vec_reduce_sum(sq_acc));
     }
@@ -317,27 +281,20 @@ static void hc_pre_scale_splitk_impl(
       const fVec irms_vec(irms);
 
       int64_t k;
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        for (k = k0; k <= k1 - (int64_t)fVec::size(); k += fVec::size()) {
-          (fVec::loadu(x_t + k) * irms_vec).store(sx_t + k);
-        }
-        if (k < k1) (fVec::loadu(x_t + k, k1 - k) * irms_vec).store(sx_t + k, k1 - k);
-      } else {
-        for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
-          fVec x0v, x1v;
-          std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          (x0v * irms_vec).store(sx_t + k);
-          (x1v * irms_vec).store(sx_t + k + (int64_t)fVec::size());
-        }
-        if (k < k1) {
-          const int64_t rem = k1 - k;
-          fVec x0v, x1v;
-          std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-          const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-          const int64_t rem1 = rem - rem0;
-          (x0v * irms_vec).store(sx_t + k, rem0);
-          if (rem1 > 0) (x1v * irms_vec).store(sx_t + k + fVec::size(), rem1);
-        }
+      for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
+        fVec x0v, x1v;
+        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        (x0v * irms_vec).store(sx_t + k);
+        (x1v * irms_vec).store(sx_t + k + (int64_t)fVec::size());
+      }
+      if (k < k1) {
+        const int64_t rem = k1 - k;
+        fVec x0v, x1v;
+        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
+        const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+        const int64_t rem1 = rem - rem0;
+        (x0v * irms_vec).store(sx_t + k, rem0);
+        if (rem1 > 0) (x1v * irms_vec).store(sx_t + k + fVec::size(), rem1);
       }
     }
   });
@@ -388,51 +345,33 @@ static void hc_pre_combine_impl(
       scalar_t* y_t = y + t * d;
 
       int64_t k;
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        // float32: direct vectorized sum
-        for (k = 0; k <= d - fVec::size(); k += fVec::size()) {
-          fVec acc = fVec::loadu(x_t + k) * pre_fvec[0];
-          for (int h = 1; h < HC; ++h)
-            acc += fVec::loadu(x_t + h * d + k) * pre_fvec[h];
-          acc.store(y_t + k);
+      // bf16: convert and accumulate
+      for (k = 0; k <= d - kVecSize; k += kVecSize) {
+        fVec acc0, acc1;
+        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        acc0 *= pre_fvec[0];
+        acc1 *= pre_fvec[0];
+        for (int h = 1; h < HC; ++h) {
+          fVec f0, f1;
+          std::tie(f0, f1) = at::vec::convert_to_float(bVec::loadu(x_t + h * d + k));
+          acc0 += f0 * pre_fvec[h];
+          acc1 += f1 * pre_fvec[h];
         }
-      } else {
-        // bf16/fp16: convert and accumulate
-        for (k = 0; k <= d - kVecSize; k += kVecSize) {
-          fVec acc0, acc1;
-          std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          acc0 *= pre_fvec[0];
-          acc1 *= pre_fvec[0];
-          for (int h = 1; h < HC; ++h) {
-            fVec f0, f1;
-            std::tie(f0, f1) = at::vec::convert_to_float(bVec::loadu(x_t + h * d + k));
-            acc0 += f0 * pre_fvec[h];
-            acc1 += f1 * pre_fvec[h];
-          }
-          at::vec::convert_from_float<scalar_t>(acc0, acc1).store(y_t + k);
-        }
+        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(y_t + k);
       }
       if (k < d) {
-        if constexpr (std::is_same_v<scalar_t, float>) {
-          const int64_t rem = d - k;
-          fVec acc = fVec::loadu(x_t + k, rem) * pre_fvec[0];
-          for (int h = 1; h < HC; ++h)
-            acc += fVec::loadu(x_t + h * d + k, rem) * pre_fvec[h];
-          acc.store(y_t + k, rem);
-        } else {
-          const int64_t rem = d - k;
-          fVec acc0, acc1;
-          std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-          acc0 *= pre_fvec[0];
-          acc1 *= pre_fvec[0];
-          for (int h = 1; h < HC; ++h) {
-            fVec f0, f1;
-            std::tie(f0, f1) = at::vec::convert_to_float(bVec::loadu(x_t + h * d + k, rem));
-            acc0 += f0 * pre_fvec[h];
-            acc1 += f1 * pre_fvec[h];
-          }
-          at::vec::convert_from_float<scalar_t>(acc0, acc1).store(y_t + k, rem);
+        const int64_t rem = d - k;
+        fVec acc0, acc1;
+        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
+        acc0 *= pre_fvec[0];
+        acc1 *= pre_fvec[0];
+        for (int h = 1; h < HC; ++h) {
+          fVec f0, f1;
+          std::tie(f0, f1) = at::vec::convert_to_float(bVec::loadu(x_t + h * d + k, rem));
+          acc0 += f0 * pre_fvec[h];
+          acc1 += f1 * pre_fvec[h];
         }
+        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(y_t + k, rem);
       }
     }
   });
@@ -473,57 +412,33 @@ static void hc_post_impl(
         comb_fvec[i] = fVec(comb_t[i * HC + h]);
 
       int64_t k;
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        // float32: direct vectorized computation
-        for (k = 0; k <= d - fVec::size(); k += fVec::size()) {
-          fVec acc = post_fvec * fVec::loadu(x_t + k);
-          for (int i = 0; i < HC; ++i)
-            acc += comb_fvec[i] * fVec::loadu(res_t + i * d + k);
-          acc.store(out_th + k);
+      // bf16: convert and accumulate
+      for (k = 0; k <= d - kVecSize; k += kVecSize) {
+        fVec acc0, acc1;
+        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        acc0 = post_fvec * acc0;
+        acc1 = post_fvec * acc1;
+        for (int i = 0; i < HC; ++i) {
+          fVec r0, r1;
+          std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k));
+          acc0 += comb_fvec[i] * r0;
+          acc1 += comb_fvec[i] * r1;
         }
-      } else {
-        // bf16/fp16: convert and accumulate
-        for (k = 0; k <= d - kVecSize; k += kVecSize) {
-          // post term
-          bVec xbv = bVec::loadu(x_t + k);
-          fVec acc0, acc1;
-          std::tie(acc0, acc1) = at::vec::convert_to_float(xbv);
-          acc0 = post_fvec * acc0;
-          acc1 = post_fvec * acc1;
-
-          // residual terms: sum_i comb[t,i,h] * residual[t,i,k]
-          for (int i = 0; i < HC; ++i) {
-            bVec rbv = bVec::loadu(res_t + i * d + k);
-            fVec r0, r1;
-            std::tie(r0, r1) = at::vec::convert_to_float(rbv);
-            acc0 += comb_fvec[i] * r0;
-            acc1 += comb_fvec[i] * r1;
-          }
-
-          at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k);
-        }
+        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k);
       }
       if (k < d) {
-        if constexpr (std::is_same_v<scalar_t, float>) {
-          const int64_t rem = d - k;
-          fVec acc = post_fvec * fVec::loadu(x_t + k, rem);
-          for (int i = 0; i < HC; ++i)
-            acc += comb_fvec[i] * fVec::loadu(res_t + i * d + k, rem);
-          acc.store(out_th + k, rem);
-        } else {
-          const int64_t rem = d - k;
-          fVec acc0, acc1;
-          std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-          acc0 = post_fvec * acc0;
-          acc1 = post_fvec * acc1;
-          for (int i = 0; i < HC; ++i) {
-            fVec r0, r1;
-            std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k, rem));
-            acc0 += comb_fvec[i] * r0;
-            acc1 += comb_fvec[i] * r1;
-          }
-          at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k, rem);
+        const int64_t rem = d - k;
+        fVec acc0, acc1;
+        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
+        acc0 = post_fvec * acc0;
+        acc1 = post_fvec * acc1;
+        for (int i = 0; i < HC; ++i) {
+          fVec r0, r1;
+          std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k, rem));
+          acc0 += comb_fvec[i] * r0;
+          acc1 += comb_fvec[i] * r1;
         }
+        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k, rem);
       }
     }
   });
@@ -575,49 +490,33 @@ static void hc_post_splitk_impl(
         comb_fvec[i] = fVec(comb_t[i * HC + h]);
 
       int64_t k;
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        for (k = k0; k <= k1 - (int64_t)fVec::size(); k += fVec::size()) {
-          fVec acc = post_fvec * fVec::loadu(x_t + k);
-          for (int i = 0; i < HC; ++i)
-            acc += comb_fvec[i] * fVec::loadu(res_t + i * d + k);
-          acc.store(out_th + k);
+      // bf16: convert and accumulate
+      for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
+        fVec acc0, acc1;
+        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        acc0 = post_fvec * acc0;
+        acc1 = post_fvec * acc1;
+        for (int i = 0; i < HC; ++i) {
+          fVec r0, r1;
+          std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k));
+          acc0 += comb_fvec[i] * r0;
+          acc1 += comb_fvec[i] * r1;
         }
-      } else {
-        for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
-          fVec acc0, acc1;
-          std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          acc0 = post_fvec * acc0;
-          acc1 = post_fvec * acc1;
-          for (int i = 0; i < HC; ++i) {
-            fVec r0, r1;
-            std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k));
-            acc0 += comb_fvec[i] * r0;
-            acc1 += comb_fvec[i] * r1;
-          }
-          at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k);
-        }
+        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k);
       }
       if (k < k1) {
-        if constexpr (std::is_same_v<scalar_t, float>) {
-          const int64_t rem = k1 - k;
-          fVec acc = post_fvec * fVec::loadu(x_t + k, rem);
-          for (int i = 0; i < HC; ++i)
-            acc += comb_fvec[i] * fVec::loadu(res_t + i * d + k, rem);
-          acc.store(out_th + k, rem);
-        } else {
-          const int64_t rem = k1 - k;
-          fVec acc0, acc1;
-          std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-          acc0 = post_fvec * acc0;
-          acc1 = post_fvec * acc1;
-          for (int i = 0; i < HC; ++i) {
-            fVec r0, r1;
-            std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k, rem));
-            acc0 += comb_fvec[i] * r0;
-            acc1 += comb_fvec[i] * r1;
-          }
-          at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k, rem);
+        const int64_t rem = k1 - k;
+        fVec acc0, acc1;
+        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
+        acc0 = post_fvec * acc0;
+        acc1 = post_fvec * acc1;
+        for (int i = 0; i < HC; ++i) {
+          fVec r0, r1;
+          std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k, rem));
+          acc0 += comb_fvec[i] * r0;
+          acc1 += comb_fvec[i] * r1;
         }
+        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k, rem);
       }
     }
   });
@@ -662,46 +561,29 @@ static void hc_head_gemm_fuse_impl(
       fVec sq_acc(0.f);
       fVec dot_acc[HC] = {fVec(0.f), fVec(0.f), fVec(0.f), fVec(0.f)};
 
+      // Pass 1: rms + dot-products over flattened [HC*d], bf16 input.
       int64_t k = 0;
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        for (; k <= hc_d - (int64_t)fVec::size(); k += fVec::size()) {
-          fVec xv = fVec::loadu(x_t + k);
-          sq_acc += xv * xv;
-          for (int h = 0; h < HC; ++h) {
-            dot_acc[h] += xv * fVec::loadu(hc_fn + h * hc_d + k);
-          }
+      for (; k <= hc_d - kVecSize; k += kVecSize) {
+        fVec x0, x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+        sq_acc += x0 * x0 + x1 * x1;
+        for (int h = 0; h < HC; ++h) {
+          const float* w = hc_fn + h * hc_d + k;
+          dot_acc[h] += x0 * fVec::loadu(w);
+          dot_acc[h] += x1 * fVec::loadu(w + (int64_t)fVec::size());
         }
-        if (k < hc_d) {
-          const int64_t rem = hc_d - k;
-          fVec xv = fVec::loadu(x_t + k, rem);
-          sq_acc += xv * xv;
-          for (int h = 0; h < HC; ++h) {
-            dot_acc[h] += xv * fVec::loadu(hc_fn + h * hc_d + k, rem);
-          }
-        }
-      } else {
-        for (; k <= hc_d - kVecSize; k += kVecSize) {
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          sq_acc += x0 * x0 + x1 * x1;
-          for (int h = 0; h < HC; ++h) {
-            const float* w = hc_fn + h * hc_d + k;
-            dot_acc[h] += x0 * fVec::loadu(w);
-            dot_acc[h] += x1 * fVec::loadu(w + (int64_t)fVec::size());
-          }
-        }
-        if (k < hc_d) {
-          const int64_t rem = hc_d - k;
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-          sq_acc += x0 * x0 + x1 * x1;
-          const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-          const int64_t rem1 = rem - rem0;
-          for (int h = 0; h < HC; ++h) {
-            const float* w = hc_fn + h * hc_d + k;
-            dot_acc[h] += x0 * fVec::loadu(w, rem0);
-            if (rem1 > 0) dot_acc[h] += x1 * fVec::loadu(w + (int64_t)fVec::size(), rem1);
-          }
+      }
+      if (k < hc_d) {
+        const int64_t rem = hc_d - k;
+        fVec x0, x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
+        sq_acc += x0 * x0 + x1 * x1;
+        const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+        const int64_t rem1 = rem - rem0;
+        for (int h = 0; h < HC; ++h) {
+          const float* w = hc_fn + h * hc_d + k;
+          dot_acc[h] += x0 * fVec::loadu(w, rem0);
+          if (rem1 > 0) dot_acc[h] += x1 * fVec::loadu(w + (int64_t)fVec::size(), rem1);
         }
       }
 
@@ -716,66 +598,264 @@ static void hc_head_gemm_fuse_impl(
         pre[h] = 1.f / (1.f + std::exp(-gate_in)) + hc_eps;
       }
 
-      // Pass 2: combine with h-outer order for sequential x[t,h,:] streaming.
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        std::memset(y_t, 0, d * sizeof(float));
-        for (int h = 0; h < HC; ++h) {
-          const fVec pre_fvec(pre[h]);
-          const float* x_th = x_t + h * d;
-          int64_t kk = 0;
-          for (; kk <= d - (int64_t)fVec::size(); kk += fVec::size()) {
-            (fVec::loadu(y_t + kk) + pre_fvec * fVec::loadu(x_th + kk)).store(y_t + kk);
-          }
-          if (kk < d) {
-            const int64_t rem = d - kk;
-            (fVec::loadu(y_t + kk, rem) + pre_fvec * fVec::loadu(x_th + kk, rem)).store(y_t + kk, rem);
-          }
-        }
-      } else {
-        std::memset(sc, 0, d * sizeof(float));
-        for (int h = 0; h < HC; ++h) {
-          const fVec pre_fvec(pre[h]);
-          const scalar_t* x_th = x_t + h * d;
-          int64_t kk = 0;
-          for (; kk <= d - kVecSize; kk += kVecSize) {
-            fVec x0, x1;
-            std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
-            (fVec::loadu(sc + kk) + pre_fvec * x0).store(sc + kk);
-            (fVec::loadu(sc + kk + (int64_t)fVec::size()) + pre_fvec * x1).store(sc + kk + (int64_t)fVec::size());
-          }
-          if (kk < d) {
-            const int64_t rem = d - kk;
-            fVec x0, x1;
-            std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
-            const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-            const int64_t rem1 = rem - rem0;
-            (fVec::loadu(sc + kk, rem0) + pre_fvec * x0).store(sc + kk, rem0);
-            if (rem1 > 0)
-              (fVec::loadu(sc + kk + (int64_t)fVec::size(), rem1) + pre_fvec * x1)
-                  .store(sc + kk + (int64_t)fVec::size(), rem1);
-          }
-        }
-
+      // Pass 2: h-outer combine, bf16 path: accumulate into fp32 scratch, then convert.
+      std::memset(sc, 0, d * sizeof(float));
+      for (int h = 0; h < HC; ++h) {
+        const fVec pre_fvec(pre[h]);
+        const scalar_t* x_th = x_t + h * d;
         int64_t kk = 0;
         for (; kk <= d - kVecSize; kk += kVecSize) {
-          at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + kk), fVec::loadu(sc + kk + (int64_t)fVec::size()))
-              .store(y_t + kk);
+          fVec x0, x1;
+          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
+          (fVec::loadu(sc + kk) + pre_fvec * x0).store(sc + kk);
+          (fVec::loadu(sc + kk + (int64_t)fVec::size()) + pre_fvec * x1).store(sc + kk + (int64_t)fVec::size());
         }
         if (kk < d) {
           const int64_t rem = d - kk;
+          fVec x0, x1;
+          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
           const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
           const int64_t rem1 = rem - rem0;
-          at::vec::convert_from_float<scalar_t>(
-              fVec::loadu(sc + kk, rem0), rem1 > 0 ? fVec::loadu(sc + kk + (int64_t)fVec::size(), rem1) : fVec(0.f))
-              .store(y_t + kk, rem);
+          (fVec::loadu(sc + kk, rem0) + pre_fvec * x0).store(sc + kk, rem0);
+          if (rem1 > 0)
+            (fVec::loadu(sc + kk + (int64_t)fVec::size(), rem1) + pre_fvec * x1)
+                .store(sc + kk + (int64_t)fVec::size(), rem1);
         }
+      }
+
+      // Convert fp32 accumulator → bf16 output
+      int64_t kk = 0;
+      for (; kk <= d - kVecSize; kk += kVecSize) {
+        at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + kk), fVec::loadu(sc + kk + (int64_t)fVec::size()))
+            .store(y_t + kk);
+      }
+      if (kk < d) {
+        const int64_t rem = d - kk;
+        const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+        const int64_t rem1 = rem - rem0;
+        at::vec::convert_from_float<scalar_t>(
+            fVec::loadu(sc + kk, rem0), rem1 > 0 ? fVec::loadu(sc + kk + (int64_t)fVec::size(), rem1) : fVec(0.f))
+            .store(y_t + kk, rem);
       }
     }
   });
 }
 
 // ---------------------------------------------------------------------------
-// hc_head_brgemm_fuse_impl<scalar_t, HC>
+// hc_head_splitk_fuse_impl<scalar_t, HC>
+// Small-T fused path that saturates ~40 threads even for T=1.
+//
+// Problem: for T=1 the large-T path (grain=1 over T) only spawns 1 task,
+// leaving 39 threads idle.  This version splits the K=HC*d dimension so
+// that T × n_k_blocks tasks fill all threads in Phase 1.
+//
+// Three-phase structure (two parallel_for + one barrier between them):
+//
+//   Phase 1 – parallel over T × n_k_blocks (grain=1):
+//     Each task processes a [k0, k1) slice of the flattened input.
+//     Produces partials: partial_sq[t,kb] and partial_dot[t,kb,HC].
+//
+//   Phase 2 – parallel over T (grain=1):
+//     Reduce partials → inv_rms, apply sigmoid gate → pre[t, HC].
+//
+//   Phase 3 – parallel over T × n_d_blocks (grain=1):
+//     h-outer combine: y[t, k0:k1] = Σ_h pre[t,h] * x[t,h, k0:k1].
+//     d is split into the same block size as K so both phases saturate threads.
+//
+// Memory layout of partials:
+//   partials[(t * n_k_blocks + kb) * (1 + HC)]
+//     [0]       = partial sq_acc (float)
+//     [1..HC]   = partial dot_acc[h] (float, h=0..HC-1)
+// ---------------------------------------------------------------------------
+template <typename scalar_t, int HC>
+static void hc_head_splitk_fuse_impl(
+    scalar_t* __restrict__ y,         // [T, d]
+    const scalar_t* __restrict__ x,   // [T, HC, d]
+    const float* __restrict__ hc_fn,  // [HC, HC*d]  row-major
+    float hc_scale_val,
+    const float* __restrict__ hc_base,  // [HC]
+    int64_t T,
+    int64_t d,
+    float hc_eps,
+    float norm_eps) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = bVec::size();
+  constexpr int64_t kFVecSize = fVec::size();  // 16 floats (AVX512)
+  const int64_t hc_d = HC * d;
+
+  // Block size: 512 floats = 2KB per K-block.  Each Phase-1 task reads the
+  // block from x (2KB) plus HC weight slices (HC*2KB=8KB) — fits in L1 cache.
+  constexpr int64_t K_BLOCK = 512;
+  const int64_t n_k_blocks = div_up(hc_d, K_BLOCK);
+  const int64_t n_d_blocks = div_up(d, K_BLOCK);
+
+  // partials[t, kb, 1+HC]  (sq + HC dot products)
+  constexpr int64_t partial_stride = 1 + HC;
+  std::vector<float> partials(static_cast<size_t>(T * n_k_blocks * partial_stride), 0.f);
+  std::vector<float> pre_buf(static_cast<size_t>(T * HC));
+
+  // ── Phase 1: T × n_k_blocks tasks ────────────────────────────────────────
+  at::parallel_for(0, T * n_k_blocks, 1, [&](int64_t begin, int64_t end) {
+    // Per-thread upcast scratch: 512 f32 = 2 KB — stays in L1 across all heads.
+    float a_float[K_BLOCK];
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const int64_t t = idx / n_k_blocks;
+      const int64_t kb = idx % n_k_blocks;
+      const int64_t k0 = kb * K_BLOCK;
+      const int64_t len = std::min(K_BLOCK, hc_d - k0);
+
+      const scalar_t* a = x + t * hc_d + k0;
+      float* p = partials.data() + (t * n_k_blocks + kb) * partial_stride;
+
+      // Step 1: upcast bf16 → float once into a_float (contiguous write).
+      {
+        int64_t k = 0;
+        for (; k <= len - kVecSize; k += kVecSize) {
+          fVec xf0, xf1;
+          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(a + k));
+          xf0.store(a_float + k);
+          xf1.store(a_float + k + kFVecSize);
+        }
+        if (k < len) {
+          const int64_t rem = len - k;
+          const int64_t rem0 = std::min(rem, kFVecSize);
+          const int64_t rem1 = rem - rem0;
+          fVec xf0, xf1;
+          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(a + k, rem));
+          xf0.store(a_float + k, rem0);
+          if (rem1 > 0) xf1.store(a_float + k + kFVecSize, rem1);
+        }
+      }
+
+      // Step 2: sq — KU=4 unrolled float loop on a_float.
+      {
+        constexpr int64_t STEP = 4 * kFVecSize;
+        fVec sq_u[4] = {fVec(0.f), fVec(0.f), fVec(0.f), fVec(0.f)};
+        int64_t k = 0;
+        for (; k <= len - STEP; k += STEP) {
+          const fVec x0 = fVec::loadu(a_float + k);
+          const fVec x1 = fVec::loadu(a_float + k + kFVecSize);
+          const fVec x2 = fVec::loadu(a_float + k + 2 * kFVecSize);
+          const fVec x3 = fVec::loadu(a_float + k + 3 * kFVecSize);
+          sq_u[0] += x0 * x0;
+          sq_u[1] += x1 * x1;
+          sq_u[2] += x2 * x2;
+          sq_u[3] += x3 * x3;
+        }
+        fVec sq_acc = (sq_u[0] + sq_u[1]) + (sq_u[2] + sq_u[3]);
+        for (; k <= len - kFVecSize; k += kFVecSize) {
+          const fVec xf = fVec::loadu(a_float + k);
+          sq_acc += xf * xf;
+        }
+        if (k < len) {
+          const fVec xf = fVec::loadu(a_float + k, len - k);
+          sq_acc += xf * xf;
+        }
+        p[0] = vec_reduce_sum(sq_acc);
+      }
+
+      // Step 3: dot — h-outer KU=4 float loop; each head streams its weight
+      // row contiguously (hc_fn[h][k0..k0+len]), no inter-head strides.
+      for (int h = 0; h < HC; ++h) {
+        const float* w = hc_fn + h * hc_d + k0;
+        constexpr int64_t STEP = 4 * kFVecSize;
+        fVec dot_u[4] = {fVec(0.f), fVec(0.f), fVec(0.f), fVec(0.f)};
+        int64_t k = 0;
+        for (; k <= len - STEP; k += STEP) {
+          dot_u[0] += fVec::loadu(a_float + k) * fVec::loadu(w + k);
+          dot_u[1] += fVec::loadu(a_float + k + kFVecSize) * fVec::loadu(w + k + kFVecSize);
+          dot_u[2] += fVec::loadu(a_float + k + 2 * kFVecSize) * fVec::loadu(w + k + 2 * kFVecSize);
+          dot_u[3] += fVec::loadu(a_float + k + 3 * kFVecSize) * fVec::loadu(w + k + 3 * kFVecSize);
+        }
+        fVec dot_acc = (dot_u[0] + dot_u[1]) + (dot_u[2] + dot_u[3]);
+        for (; k <= len - kFVecSize; k += kFVecSize) {
+          dot_acc += fVec::loadu(a_float + k) * fVec::loadu(w + k);
+        }
+        if (k < len) {
+          dot_acc += fVec::loadu(a_float + k, len - k) * fVec::loadu(w + k, len - k);
+        }
+        p[1 + h] = vec_reduce_sum(dot_acc);
+      }
+    }
+  });
+
+  // ── Phase 2: reduce + gate (serial) ──────────────────────────────────────
+  // Work = T × n_k_blocks × (1 + HC) floats ≈ 32 × 32 × 5 = 5120 ops at most.
+  // Parallelising this would cost more in thread-scheduling overhead than it
+  // saves, so we simply run it in the caller thread.
+  for (int64_t t = 0; t < T; ++t) {
+    double sq_total = 0.0;
+    float dot_total[HC] = {};
+    for (int64_t kb = 0; kb < n_k_blocks; ++kb) {
+      const float* p = partials.data() + (t * n_k_blocks + kb) * partial_stride;
+      sq_total += static_cast<double>(p[0]);
+      for (int h = 0; h < HC; ++h)
+        dot_total[h] += p[1 + h];
+    }
+    const float inv_rms =
+        static_cast<float>(1.0 / std::sqrt(sq_total / static_cast<double>(hc_d) + static_cast<double>(norm_eps)));
+    float* pre = pre_buf.data() + t * HC;
+    for (int h = 0; h < HC; ++h) {
+      const float gate_in = dot_total[h] * inv_rms * hc_scale_val + hc_base[h];
+      pre[h] = 1.f / (1.f + std::exp(-gate_in)) + hc_eps;
+    }
+  }
+
+  // ── Phase 3: h-outer combine, T × n_d_blocks tasks ───────────────────────
+  at::parallel_for(0, T * n_d_blocks, 1, [&](int64_t begin, int64_t end) {
+    float sc[K_BLOCK];  // per-task fp32 scratch for bf16 output path
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const int64_t t = idx / n_d_blocks;
+      const int64_t db = idx % n_d_blocks;
+      const int64_t k0 = db * K_BLOCK;
+      const int64_t len = std::min(K_BLOCK, d - k0);
+
+      const float* pre = pre_buf.data() + t * HC;
+      const scalar_t* x_t = x + t * hc_d;
+      scalar_t* y_t = y + t * d;
+
+      // bf16: accumulate into fp32 scratch, then convert to output.
+      std::memset(sc, 0, len * sizeof(float));
+      for (int h = 0; h < HC; ++h) {
+        const fVec pv(pre[h]);
+        const scalar_t* xh = x_t + (int64_t)h * d + k0;
+        int64_t k = 0;
+        for (; k <= len - kVecSize; k += kVecSize) {
+          fVec xf0, xf1;
+          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(xh + k));
+          (fVec::loadu(sc + k) + pv * xf0).store(sc + k);
+          (fVec::loadu(sc + k + kFVecSize) + pv * xf1).store(sc + k + kFVecSize);
+        }
+        if (k < len) {
+          const int64_t rem = len - k;
+          const int64_t rem0 = std::min(rem, kFVecSize);
+          const int64_t rem1 = rem - rem0;
+          fVec xf0, xf1;
+          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(xh + k, rem));
+          (fVec::loadu(sc + k, rem0) + pv * xf0).store(sc + k, rem0);
+          if (rem1 > 0) (fVec::loadu(sc + k + kFVecSize, rem1) + pv * xf1).store(sc + k + kFVecSize, rem1);
+        }
+      }
+      scalar_t* yt = y_t + k0;
+      int64_t kk = 0;
+      for (; kk <= len - kVecSize; kk += kVecSize) {
+        at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + kk), fVec::loadu(sc + kk + kFVecSize)).store(yt + kk);
+      }
+      if (kk < len) {
+        const int64_t rem = len - kk;
+        const int64_t rem0 = std::min(rem, kFVecSize);
+        const int64_t rem1 = rem - rem0;
+        at::vec::convert_from_float<scalar_t>(
+            fVec::loadu(sc + kk, rem0), rem1 > 0 ? fVec::loadu(sc + kk + kFVecSize, rem1) : fVec(0.f))
+            .store(yt + kk, rem);
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// hc_head_fuse_impl<scalar_t, HC>
 // Large-T fused path built on top of existing brgemm:
 //   1) per-token inv_rms on x_flat
 //   2) block GEMM raw_mixes = x_flat @ hc_fn.T via brgemm
@@ -786,7 +866,7 @@ static void hc_head_gemm_fuse_impl(
 // kernel instead of a handwritten dot-product loop.
 // ---------------------------------------------------------------------------
 template <typename scalar_t, int HC>
-static void hc_head_brgemm_fuse_impl(
+static void hc_head_fuse_impl(
     scalar_t* __restrict__ y,
     const scalar_t* __restrict__ x,
     const float* __restrict__ hc_fn,  // [HC, HC*d] row-major (NOT transposed)
@@ -799,6 +879,7 @@ static void hc_head_brgemm_fuse_impl(
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int64_t kVecSize = bVec::size();
+  constexpr int64_t kFVecSize = fVec::size();
   const int64_t hc_d = HC * d;
 
   // ── Parallelism: grain=1 gives T independent tasks (e.g. 128 for T=128),
@@ -807,69 +888,139 @@ static void hc_head_brgemm_fuse_impl(
   // that case already falls back to the splitk path (kSmallTokenThreshold=8).
   //
   // N=HC=4 is below tinygemm_kernel's minimum block width (16).  Instead we
-  // fuse the RMSnorm sq-sum with the HC dot-products in ONE pass over x[t,:],
-  // so each 64-KB token row is read only TWICE (sq+gemm fused, then combine)
-  // rather than three times (sq pass, GEMM pass, combine pass separately).
+  // fuse the RMSnorm sq-sum with the HC dot-products in ONE pass over x[t,:].
+  // k-tiled Phase 1: upcast K_BLOCK bf16→float, consumed by all HC heads.
+  // d-tiled Phase 2: accumulate K_BLOCK floats from HC heads, fused convert.
+  // Both phases run sequentially and share ONE tile buffer per thread.
+  // Scratch per thread: K_BLOCK floats = 2KB << 32KB L1.
+  constexpr int64_t K_BLOCK = 512;  // must be >= STEP_DOT (=KU_DOT*kFVecSize)
+  const int64_t num_threads = at::get_num_threads();
+  const int64_t scratch_stride = K_BLOCK;  // reused by both phases
+  auto scratch_tensor = at::empty({num_threads * scratch_stride}, at::kFloat);
+  float* const scratch_base = scratch_tensor.data_ptr<float>();
+
+  // Constants and per-thread vec accumulators are kept outside the t-loop so
+  // the arrays are allocated once per thread, not once per token.
+  constexpr int64_t KU_DOT = 8;
+  constexpr int64_t STEP_DOT = KU_DOT * kFVecSize;
+
   at::parallel_for(0, T, 1, [&](int64_t begin, int64_t end) {
-    // Per-thread scratch – sized for one token at a time to minimise memory.
-    // a_buf: bf16→float upcast of one token row (float path: unused / zero-size)
-    // sc   : fp32 combine accumulator (bf16 output path only)
-    std::vector<float> a_buf(std::is_same_v<scalar_t, float> ? size_t{0} : static_cast<size_t>(hc_d));
-    std::vector<float> sc(static_cast<size_t>(d));
-    float* const a_buf_ptr = a_buf.empty() ? nullptr : a_buf.data();
-    float* const sc_ptr = sc.data();
+    const int64_t tid = at::get_thread_num();
+    float* const a_tile_ptr = scratch_base + tid * scratch_stride;
+    float* const sc_ptr = a_tile_ptr;  // reused: Phase 1 & 2 are sequential
+
+    // Reusable fVec temporaries — declared once, reused across all loops.
+    fVec v0, v1;
+    fVec sq_u[KU_DOT];
+    fVec sq_acc;
+    fVec dot_acc[HC];
+    fVec dot_u[KU_DOT];
+    fVec pre_fvec;
 
     for (int64_t t = begin; t < end; ++t) {
       const scalar_t* x_t = x + t * hc_d;
       scalar_t* y_t = y + t * d;
 
-      // ── Step 1: optional bf16→float upcast + fused sq_acc + HC dot-products
-      //    One pass over a_row[hc_d]. For float: a_row == x_t (zero-copy).
-      const float* a_row;
-      if constexpr (!std::is_same_v<scalar_t, float>) {
-        // Upcast bf16 → float into a_buf
-        int64_t k = 0;
-        for (; k <= hc_d - kVecSize; k += kVecSize) {
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-          x0.store(a_buf_ptr + k);
-          x1.store(a_buf_ptr + k + (int64_t)fVec::size());
-        }
-        if (k < hc_d) {
-          const int64_t rem = hc_d - k;
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-          const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-          const int64_t rem1 = rem - rem0;
-          x0.store(a_buf_ptr + k, rem0);
-          if (rem1 > 0) x1.store(a_buf_ptr + k + (int64_t)fVec::size(), rem1);
-        }
-        a_row = a_buf_ptr;
-      } else {
-        a_row = reinterpret_cast<const float*>(x_t);
-      }
-
-      // Fused sq_acc + HC dot-product accumulators – single vectorised pass.
-      // hc_fn[h, k] is contiguous per head (row-major [HC, hc_d]).
-      fVec sq_acc(0.f);
-      fVec dot_acc[HC];
+      // ── k-tiled: upcast + sq+dot fused per tile ────────────────────────
+      // Each tile upcasts K_BLOCK bf16→float into a_tile_ptr (2KB), then
+      // all HC heads consume that same 2KB before advancing k.  No separate
+      // full-width a_buf write needed; scratch is K_BLOCK+d instead of hc_d+d.
+#pragma GCC unroll 4
       for (int h = 0; h < HC; ++h)
         dot_acc[h] = fVec(0.f);
+      sq_acc = fVec(0.f);
 
-      int64_t k = 0;
-      for (; k <= hc_d - (int64_t)fVec::size(); k += fVec::size()) {
-        const fVec xv = fVec::loadu(a_row + k);
-        sq_acc += xv * xv;
-        for (int h = 0; h < HC; ++h)
-          dot_acc[h] += xv * fVec::loadu(hc_fn + h * hc_d + k);
-      }
-      if (k < hc_d) {
-        const int64_t rem = hc_d - k;
-        const fVec xv = fVec::loadu(a_row + k, rem);
-        sq_acc += xv * xv;
-        for (int h = 0; h < HC; ++h)
-          dot_acc[h] += xv * fVec::loadu(hc_fn + h * hc_d + k, rem);
-      }
+      for (int64_t k0 = 0; k0 < hc_d; k0 += K_BLOCK) {
+        const int64_t len = std::min(K_BLOCK, hc_d - k0);
+        const scalar_t* x_k0 = x_t + k0;
+
+        // Step 1 (tile): upcast bf16 → float into a_tile_ptr
+        {
+          int64_t k = 0;
+          for (; k <= len - kVecSize; k += kVecSize) {
+            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_k0 + k));
+            v0.store(a_tile_ptr + k);
+            v1.store(a_tile_ptr + k + kFVecSize);
+          }
+          if (k < len) {
+            const int64_t rem = len - k;
+            const int64_t rem0 = std::min(rem, kFVecSize);
+            const int64_t rem1 = rem - rem0;
+            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_k0 + k, rem));
+            v0.store(a_tile_ptr + k, rem0);
+            if (rem1 > 0) v1.store(a_tile_ptr + k + kFVecSize, rem1);
+          }
+        }
+        const float* a_tile = a_tile_ptr;
+
+        // h=0: sq and dot fused for this tile ─────────────────────────────
+        {
+          const float* w0 = hc_fn + k0;
+#pragma GCC unroll 8
+          for (int u = 0; u < KU_DOT; ++u) {
+            dot_u[u] = fVec(0.f);
+            sq_u[u] = fVec(0.f);
+          }
+          int64_t kk = 0;
+          for (; kk <= len - STEP_DOT; kk += STEP_DOT) {
+#pragma GCC unroll 8
+            for (int u = 0; u < KU_DOT; ++u) {
+              v0 = fVec::loadu(a_tile + kk + u * kFVecSize);
+              dot_u[u] += v0 * fVec::loadu(w0 + kk + u * kFVecSize);
+              sq_u[u] += v0 * v0;
+            }
+          }
+          fVec dacc = ((dot_u[0] + dot_u[1]) + (dot_u[2] + dot_u[3])) + ((dot_u[4] + dot_u[5]) + (dot_u[6] + dot_u[7]));
+          sq_acc += ((sq_u[0] + sq_u[1]) + (sq_u[2] + sq_u[3])) + ((sq_u[4] + sq_u[5]) + (sq_u[6] + sq_u[7]));
+          // dot+sq tile-tail together
+          for (; kk <= len - 2 * kFVecSize; kk += 2 * kFVecSize) {
+            v0 = fVec::loadu(a_tile + kk);
+            v1 = fVec::loadu(a_tile + kk + kFVecSize);
+            dacc += v0 * fVec::loadu(w0 + kk) + v1 * fVec::loadu(w0 + kk + kFVecSize);
+            sq_acc += v0 * v0 + v1 * v1;
+          }
+          for (; kk <= len - kFVecSize; kk += kFVecSize) {
+            v0 = fVec::loadu(a_tile + kk);
+            dacc += v0 * fVec::loadu(w0 + kk);
+            sq_acc += v0 * v0;
+          }
+          if (kk < len) {
+            v0 = fVec::loadu(a_tile + kk, len - kk);
+            dacc += v0 * fVec::loadu(w0 + kk, len - kk);
+            sq_acc += v0 * v0;
+          }
+          dot_acc[0] += dacc;
+        }
+
+        // h=1..HC-1: dot only for this tile ───────────────────────────────
+        for (int h = 1; h < HC; ++h) {
+          const float* w = hc_fn + h * hc_d + k0;
+#pragma GCC unroll 8
+          for (int u = 0; u < KU_DOT; ++u)
+            dot_u[u] = fVec(0.f);
+          int64_t kk = 0;
+          for (; kk <= len - STEP_DOT; kk += STEP_DOT) {
+#pragma GCC unroll 8
+            for (int u = 0; u < KU_DOT; ++u)
+              dot_u[u] += fVec::loadu(a_tile + kk + u * kFVecSize) * fVec::loadu(w + kk + u * kFVecSize);
+          }
+          fVec acc = ((dot_u[0] + dot_u[1]) + (dot_u[2] + dot_u[3])) + ((dot_u[4] + dot_u[5]) + (dot_u[6] + dot_u[7]));
+          for (; kk <= len - 2 * kFVecSize; kk += 2 * kFVecSize) {
+            v0 = fVec::loadu(a_tile + kk);
+            v1 = fVec::loadu(a_tile + kk + kFVecSize);
+            acc += v0 * fVec::loadu(w + kk) + v1 * fVec::loadu(w + kk + kFVecSize);
+          }
+          for (; kk <= len - kFVecSize; kk += kFVecSize) {
+            v0 = fVec::loadu(a_tile + kk);
+            acc += v0 * fVec::loadu(w + kk);
+          }
+          if (kk < len) {
+            v0 = fVec::loadu(a_tile + kk, len - kk);
+            acc += v0 * fVec::loadu(w + kk, len - kk);
+          }
+          dot_acc[h] += acc;
+        }
+      }  // k-tile loop
 
       const float inv_rms = static_cast<float>(
           1.0 /
@@ -878,68 +1029,73 @@ static void hc_head_brgemm_fuse_impl(
 
       float pre[HC];
       for (int h = 0; h < HC; ++h) {
-        const float mix_h = vec_reduce_sum(dot_acc[h]) * inv_rms;
-        const float gate_in = mix_h * hc_scale_val + hc_base[h];
+        const float gate_in = vec_reduce_sum(dot_acc[h]) * inv_rms * hc_scale_val + hc_base[h];
         pre[h] = 1.f / (1.f + std::exp(-gate_in)) + hc_eps;
       }
 
-      // ── Step 2: h-outer combine (second pass over x_t) ─────────────────
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        float* y_tf = reinterpret_cast<float*>(y_t);
-        std::memset(y_tf, 0, d * sizeof(float));
-        for (int h = 0; h < HC; ++h) {
-          const fVec pre_fvec(pre[h]);
-          const float* x_th = reinterpret_cast<const float*>(x_t + (int64_t)h * d);
+      // ── Step 2: d-tiled combine + fused bf16 convert ──────────────────
+      // Each K_BLOCK-tile: h=0 direct-assigns (eliminates memset), h=1..HC-1
+      // accumulates, then sc_ptr converts to bf16 y_t immediately while hot.
+      // sc_ptr reuses a_tile_ptr (sequential with Phase 1, same 2KB buffer).
+      for (int64_t j0 = 0; j0 < d; j0 += K_BLOCK) {
+        const int64_t jlen = std::min(K_BLOCK, d - j0);
+
+        // h=0: direct assign — no memset required
+        {
+          pre_fvec = fVec(pre[0]);
+          const scalar_t* x_th = x_t + j0;  // h=0 segment starts at x_t
           int64_t kk = 0;
-          for (; kk <= d - (int64_t)fVec::size(); kk += fVec::size())
-            (fVec::loadu(y_tf + kk) + pre_fvec * fVec::loadu(x_th + kk)).store(y_tf + kk);
-          if (kk < d) {
-            const int64_t rem = d - kk;
-            (fVec::loadu(y_tf + kk, rem) + pre_fvec * fVec::loadu(x_th + kk, rem)).store(y_tf + kk, rem);
+          for (; kk <= jlen - kVecSize; kk += kVecSize) {
+            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
+            (pre_fvec * v0).store(sc_ptr + kk);
+            (pre_fvec * v1).store(sc_ptr + kk + kFVecSize);
           }
-        }
-      } else {
-        std::memset(sc_ptr, 0, d * sizeof(float));
-        for (int h = 0; h < HC; ++h) {
-          const fVec pre_fvec(pre[h]);
-          const scalar_t* x_th = x_t + (int64_t)h * d;
-          int64_t kk = 0;
-          for (; kk <= d - kVecSize; kk += kVecSize) {
-            fVec x0, x1;
-            std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
-            (fVec::loadu(sc_ptr + kk) + pre_fvec * x0).store(sc_ptr + kk);
-            (fVec::loadu(sc_ptr + kk + (int64_t)fVec::size()) + pre_fvec * x1)
-                .store(sc_ptr + kk + (int64_t)fVec::size());
-          }
-          if (kk < d) {
-            const int64_t rem = d - kk;
-            fVec x0, x1;
-            std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
-            const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+          if (kk < jlen) {
+            const int64_t rem = jlen - kk;
+            const int64_t rem0 = std::min(rem, kFVecSize);
             const int64_t rem1 = rem - rem0;
-            (fVec::loadu(sc_ptr + kk, rem0) + pre_fvec * x0).store(sc_ptr + kk, rem0);
-            if (rem1 > 0)
-              (fVec::loadu(sc_ptr + kk + (int64_t)fVec::size(), rem1) + pre_fvec * x1)
-                  .store(sc_ptr + kk + (int64_t)fVec::size(), rem1);
+            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
+            (pre_fvec * v0).store(sc_ptr + kk, rem0);
+            if (rem1 > 0) (pre_fvec * v1).store(sc_ptr + kk + kFVecSize, rem1);
           }
         }
-        // Convert fp32 accumulator → bf16 output
-        int64_t kk = 0;
-        for (; kk <= d - kVecSize; kk += kVecSize) {
-          at::vec::convert_from_float<scalar_t>(
-              fVec::loadu(sc_ptr + kk), fVec::loadu(sc_ptr + kk + (int64_t)fVec::size()))
-              .store(y_t + kk);
+
+        // h=1..HC-1: accumulate into sc_ptr
+        for (int h = 1; h < HC; ++h) {
+          pre_fvec = fVec(pre[h]);
+          const scalar_t* x_th = x_t + (int64_t)h * d + j0;
+          int64_t kk = 0;
+          for (; kk <= jlen - kVecSize; kk += kVecSize) {
+            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
+            (fVec::loadu(sc_ptr + kk) + pre_fvec * v0).store(sc_ptr + kk);
+            (fVec::loadu(sc_ptr + kk + kFVecSize) + pre_fvec * v1).store(sc_ptr + kk + kFVecSize);
+          }
+          if (kk < jlen) {
+            const int64_t rem = jlen - kk;
+            const int64_t rem0 = std::min(rem, kFVecSize);
+            const int64_t rem1 = rem - rem0;
+            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
+            (fVec::loadu(sc_ptr + kk, rem0) + pre_fvec * v0).store(sc_ptr + kk, rem0);
+            if (rem1 > 0)
+              (fVec::loadu(sc_ptr + kk + kFVecSize, rem1) + pre_fvec * v1).store(sc_ptr + kk + kFVecSize, rem1);
+          }
         }
-        if (kk < d) {
-          const int64_t rem = d - kk;
-          const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+
+        // fused convert: sc_ptr (hot in L1) → bf16 y_t[j0..j0+jlen)
+        int64_t kk = 0;
+        for (; kk <= jlen - kVecSize; kk += kVecSize) {
+          at::vec::convert_from_float<scalar_t>(fVec::loadu(sc_ptr + kk), fVec::loadu(sc_ptr + kk + kFVecSize))
+              .store(y_t + j0 + kk);
+        }
+        if (kk < jlen) {
+          const int64_t rem = jlen - kk;
+          const int64_t rem0 = std::min(rem, kFVecSize);
           const int64_t rem1 = rem - rem0;
           at::vec::convert_from_float<scalar_t>(
-              fVec::loadu(sc_ptr + kk, rem0),
-              rem1 > 0 ? fVec::loadu(sc_ptr + kk + (int64_t)fVec::size(), rem1) : fVec(0.f))
-              .store(y_t + kk, rem);
+              fVec::loadu(sc_ptr + kk, rem0), rem1 > 0 ? fVec::loadu(sc_ptr + kk + kFVecSize, rem1) : fVec(0.f))
+              .store(y_t + j0 + kk, rem);
         }
-      }
+      }  // d-tile loop
     }  // for t
   });  // parallel_for
 }
@@ -998,55 +1154,39 @@ static void hc_head_combine_impl(
       // Zero scratch buffer for this token
       std::memset(sc, 0, d * sizeof(float));
 
-      // h-outer accumulation into fp32 scratch
+      // h-outer accumulation into fp32 scratch, bf16 input
       for (int h = 0; h < HC; ++h) {
         const fVec pre_fvec(pre[h]);
-        const scalar_t* x_th = x_t + h * d;  // sequential access to x[t,h,:]
-
-        if constexpr (std::is_same_v<scalar_t, float>) {
-          int64_t k = 0;
-          for (; k <= d - fVec::size(); k += fVec::size())
-            (fVec::loadu(sc + k) + pre_fvec * fVec::loadu(x_th + k)).store(sc + k);
-          if (k < d) {
-            int64_t rem = d - k;
-            (fVec::loadu(sc + k, rem) + pre_fvec * fVec::loadu(x_th + k, rem)).store(sc + k, rem);
-          }
-        } else {
-          // bf16: convert x to fp32, accumulate into scratch (stays fp32)
-          int64_t k = 0;
-          for (; k <= d - kVecSize; k += kVecSize) {
-            fVec x0, x1;
-            std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + k));
-            (fVec::loadu(sc + k) + pre_fvec * x0).store(sc + k);
-            (fVec::loadu(sc + k + fVec::size()) + pre_fvec * x1).store(sc + k + fVec::size());
-          }
-          if (k < d) {
-            int64_t rem = d - k;
-            fVec x0, x1;
-            std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + k, rem));
-            int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-            int64_t rem1 = rem - rem0;
-            (fVec::loadu(sc + k, rem0) + pre_fvec * x0).store(sc + k, rem0);
-            if (rem1 > 0) (fVec::loadu(sc + k + fVec::size(), rem1) + pre_fvec * x1).store(sc + k + fVec::size(), rem1);
-          }
+        const scalar_t* x_th = x_t + h * d;
+        int64_t k = 0;
+        for (; k <= d - kVecSize; k += kVecSize) {
+          fVec x0, x1;
+          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + k));
+          (fVec::loadu(sc + k) + pre_fvec * x0).store(sc + k);
+          (fVec::loadu(sc + k + fVec::size()) + pre_fvec * x1).store(sc + k + fVec::size());
+        }
+        if (k < d) {
+          int64_t rem = d - k;
+          fVec x0, x1;
+          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + k, rem));
+          int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+          int64_t rem1 = rem - rem0;
+          (fVec::loadu(sc + k, rem0) + pre_fvec * x0).store(sc + k, rem0);
+          if (rem1 > 0) (fVec::loadu(sc + k + fVec::size(), rem1) + pre_fvec * x1).store(sc + k + fVec::size(), rem1);
         }
       }
 
-      // Write scratch → y (convert fp32 → output dtype, single pass)
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        std::memcpy(y_t, sc, d * sizeof(float));
-      } else {
-        int64_t k = 0;
-        for (; k <= d - kVecSize; k += kVecSize)
-          at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + k), fVec::loadu(sc + k + fVec::size())).store(y_t + k);
-        if (k < d) {
-          int64_t rem = d - k;
-          int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-          int64_t rem1 = rem - rem0;
-          at::vec::convert_from_float<scalar_t>(
-              fVec::loadu(sc + k, rem0), rem1 > 0 ? fVec::loadu(sc + k + fVec::size(), rem1) : fVec(0.f))
-              .store(y_t + k, rem);
-        }
+      // Write scratch → y: convert fp32 → bf16
+      int64_t k = 0;
+      for (; k <= d - kVecSize; k += kVecSize)
+        at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + k), fVec::loadu(sc + k + fVec::size())).store(y_t + k);
+      if (k < d) {
+        int64_t rem = d - k;
+        int64_t rem0 = std::min(rem, (int64_t)fVec::size());
+        int64_t rem1 = rem - rem0;
+        at::vec::convert_from_float<scalar_t>(
+            fVec::loadu(sc + k, rem0), rem1 > 0 ? fVec::loadu(sc + k + fVec::size(), rem1) : fVec(0.f))
+            .store(y_t + k, rem);
       }
     }
   });
@@ -1084,9 +1224,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
     double hc_eps) {
   RECORD_FUNCTION("sgl-kernel::hc_pre_fused_cpu", {});
   TORCH_CHECK(hc_mult == 4, "hc_pre_fused_cpu: only hc_mult=4 is supported");
-  TORCH_CHECK(
-      x.dim() == 3 && (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat),
-      "hc_pre_fused_cpu: x must be bf16 or float32 [T, hc, d]");
+  TORCH_CHECK(x.dim() == 3 && x.scalar_type() == at::kBFloat16, "hc_pre_fused_cpu: x must be bf16 [T, hc, d]");
   TORCH_CHECK(hc_fn.scalar_type() == at::kFloat, "hc_pre_fused_cpu: hc_fn must be float32");
   TORCH_CHECK(hc_scale.scalar_type() == at::kFloat, "hc_pre_fused_cpu: hc_scale must be float32");
   TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_pre_fused_cpu: hc_base must be float32");
@@ -1117,26 +1255,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
   auto scaled_x = at::empty({T, hc_d}, f32_opts);
 
   if (use_small_token_fused) {
-    // K-split parallel RMSnorm scale (Phase 1: partial sq_sum, Phase 2: inv_rms, Phase 3: scale)
-    if (x_c.scalar_type() == at::kBFloat16) {
-      hc_pre_scale_splitk_impl<c10::BFloat16>(
-          scaled_x.data_ptr<float>(), x_c.data_ptr<c10::BFloat16>(), T, hc_d, static_cast<float>(rms_eps));
-    } else if (x_c.scalar_type() == at::kFloat) {
-      hc_pre_scale_splitk_impl<float>(
-          scaled_x.data_ptr<float>(), x_c.data_ptr<float>(), T, hc_d, static_cast<float>(rms_eps));
-    } else {
-      TORCH_CHECK(false, "hc_pre_fused_cpu: unexpected scalar_type");
-    }
+    hc_pre_scale_splitk_impl<c10::BFloat16>(
+        scaled_x.data_ptr<float>(), x_c.data_ptr<c10::BFloat16>(), T, hc_d, static_cast<float>(rms_eps));
   } else {
-    // T-parallel RMSnorm scale
-    if (x_c.scalar_type() == at::kBFloat16) {
-      hc_pre_scale_impl<c10::BFloat16>(
-          scaled_x.data_ptr<float>(), x_c.data_ptr<c10::BFloat16>(), T, hc_d, static_cast<float>(rms_eps));
-    } else if (x_c.scalar_type() == at::kFloat) {
-      hc_pre_scale_impl<float>(scaled_x.data_ptr<float>(), x_c.data_ptr<float>(), T, hc_d, static_cast<float>(rms_eps));
-    } else {
-      TORCH_CHECK(false, "hc_pre_fused_cpu: unexpected scalar_type");
-    }
+    hc_pre_scale_impl<c10::BFloat16>(
+        scaled_x.data_ptr<float>(), x_c.data_ptr<c10::BFloat16>(), T, hc_d, static_cast<float>(rms_eps));
   }
 
   // GEMM: mixes [T, mix_hc] = scaled_x @ hc_fn.T  (both paths use at::mm)
@@ -1149,35 +1272,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
   auto comb = at::empty({T, hc_mult, hc_mult}, f32_opts);  // always float32
   auto y = at::empty({T, d}, x.options());                 // same dtype as x
 
-  if (x_c.scalar_type() == at::kBFloat16) {
-    hc_pre_combine_impl<c10::BFloat16, 4>(
-        y.data_ptr<c10::BFloat16>(),
-        post.data_ptr<float>(),
-        comb.data_ptr<float>(),
-        mixes.contiguous().data_ptr<float>(),
-        x_c.data_ptr<c10::BFloat16>(),
-        hc_scale_c.data_ptr<float>(),
-        hc_base_c.data_ptr<float>(),
-        T,
-        d,
-        static_cast<int>(sinkhorn_iters),
-        static_cast<float>(hc_eps));
-  } else if (x_c.scalar_type() == at::kFloat) {
-    hc_pre_combine_impl<float, 4>(
-        y.data_ptr<float>(),
-        post.data_ptr<float>(),
-        comb.data_ptr<float>(),
-        mixes.contiguous().data_ptr<float>(),
-        x_c.data_ptr<float>(),
-        hc_scale_c.data_ptr<float>(),
-        hc_base_c.data_ptr<float>(),
-        T,
-        d,
-        static_cast<int>(sinkhorn_iters),
-        static_cast<float>(hc_eps));
-  } else {
-    TORCH_CHECK(false, "hc_pre_fused_cpu: unexpected scalar_type");
-  }
+  TORCH_CHECK(x_c.scalar_type() == at::kBFloat16, "hc_pre_fused_cpu: x must be bf16");
+  hc_pre_combine_impl<c10::BFloat16, 4>(
+      y.data_ptr<c10::BFloat16>(),
+      post.data_ptr<float>(),
+      comb.data_ptr<float>(),
+      mixes.contiguous().data_ptr<float>(),
+      x_c.data_ptr<c10::BFloat16>(),
+      hc_scale_c.data_ptr<float>(),
+      hc_base_c.data_ptr<float>(),
+      T,
+      d,
+      static_cast<int>(sinkhorn_iters),
+      static_cast<float>(hc_eps));
 
   return {y, post, comb};
 }
@@ -1195,9 +1302,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
 // ---------------------------------------------------------------------------
 at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& post, at::Tensor& comb) {
   RECORD_FUNCTION("sgl-kernel::hc_post_fused_cpu", {});
-  TORCH_CHECK(
-      x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat,
-      "hc_post_fused_cpu: x must be bf16 or float32");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "hc_post_fused_cpu: x must be bf16");
   TORCH_CHECK(residual.scalar_type() == x.scalar_type(), "hc_post_fused_cpu: residual must have same dtype as x");
   TORCH_CHECK(post.scalar_type() == at::kFloat, "hc_post_fused_cpu: post must be float32");
   TORCH_CHECK(comb.scalar_type() == at::kFloat, "hc_post_fused_cpu: comb must be float32");
@@ -1220,47 +1325,25 @@ at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& po
   constexpr int64_t kSmallTaskThreshold = 8;
   const bool use_splitk = (T * hc <= kSmallTaskThreshold);
 
-  if (x_c.scalar_type() == at::kBFloat16) {
-    if (use_splitk)
-      hc_post_splitk_impl<c10::BFloat16, 4>(
-          out.data_ptr<c10::BFloat16>(),
-          x_c.data_ptr<c10::BFloat16>(),
-          residual_c.data_ptr<c10::BFloat16>(),
-          post_c.data_ptr<float>(),
-          comb_c.data_ptr<float>(),
-          T,
-          d);
-    else
-      hc_post_impl<c10::BFloat16, 4>(
-          out.data_ptr<c10::BFloat16>(),
-          x_c.data_ptr<c10::BFloat16>(),
-          residual_c.data_ptr<c10::BFloat16>(),
-          post_c.data_ptr<float>(),
-          comb_c.data_ptr<float>(),
-          T,
-          d);
-  } else if (x_c.scalar_type() == at::kFloat) {
-    if (use_splitk)
-      hc_post_splitk_impl<float, 4>(
-          out.data_ptr<float>(),
-          x_c.data_ptr<float>(),
-          residual_c.data_ptr<float>(),
-          post_c.data_ptr<float>(),
-          comb_c.data_ptr<float>(),
-          T,
-          d);
-    else
-      hc_post_impl<float, 4>(
-          out.data_ptr<float>(),
-          x_c.data_ptr<float>(),
-          residual_c.data_ptr<float>(),
-          post_c.data_ptr<float>(),
-          comb_c.data_ptr<float>(),
-          T,
-          d);
-  } else {
-    TORCH_CHECK(false, "hc_post_fused_cpu: unexpected scalar_type");
-  }
+  TORCH_CHECK(x_c.scalar_type() == at::kBFloat16, "hc_post_fused_cpu: x must be bf16");
+  if (use_splitk)
+    hc_post_splitk_impl<c10::BFloat16, 4>(
+        out.data_ptr<c10::BFloat16>(),
+        x_c.data_ptr<c10::BFloat16>(),
+        residual_c.data_ptr<c10::BFloat16>(),
+        post_c.data_ptr<float>(),
+        comb_c.data_ptr<float>(),
+        T,
+        d);
+  else
+    hc_post_impl<c10::BFloat16, 4>(
+        out.data_ptr<c10::BFloat16>(),
+        x_c.data_ptr<c10::BFloat16>(),
+        residual_c.data_ptr<c10::BFloat16>(),
+        post_c.data_ptr<float>(),
+        comb_c.data_ptr<float>(),
+        T,
+        d);
 
   return out;
 }
@@ -1286,8 +1369,8 @@ at::Tensor hc_head_fused_cpu(
   const int64_t hc_mult = x.size(1);
   TORCH_CHECK(hc_mult == 4, "hc_head_fused_cpu: only hc_mult=4 is supported");
   TORCH_CHECK(
-      x.dim() == 3 && x.is_contiguous() && (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat),
-      "hc_head_fused_cpu: x must be contiguous bf16 or float32 [T, hc, d]");
+      x.dim() == 3 && x.is_contiguous() && x.scalar_type() == at::kBFloat16,
+      "hc_head_fused_cpu: x must be contiguous bf16 [T, hc, d]");
   TORCH_CHECK(hc_fn.is_contiguous() && hc_fn.scalar_type() == at::kFloat);
   TORCH_CHECK(hc_base.is_contiguous() && hc_base.scalar_type() == at::kFloat);
   TORCH_CHECK(hc_base.numel() == hc_mult);
@@ -1298,77 +1381,43 @@ at::Tensor hc_head_fused_cpu(
   const int64_t d = x.size(2);
   const int64_t hc_d = hc_mult * d;
 
-  // Keep small-T fallback (splitk rms + at::mm + combine): for decode-like
-  // workloads the existing path has good task granularity and low overhead.
-  // Use fused tiny-gemm path for larger T to avoid scaled_x materialization.
-  constexpr int64_t kSmallTokenThreshold = 8;
-  const bool use_fused_head = (T > kSmallTokenThreshold);
+  auto y = at::empty({T, d}, x.options());
 
-  auto y = at::empty({T, d}, x.options());  // same dtype as x
-  if (use_fused_head) {
-    // hc_fn is [HC, HC*d] row-major (contiguous, checked above) – pass directly,
-    // no transposition needed by the fused kernel.
-    if (x.scalar_type() == at::kBFloat16) {
-      hc_head_brgemm_fuse_impl<c10::BFloat16, 4>(
-          y.data_ptr<c10::BFloat16>(),
-          x.data_ptr<c10::BFloat16>(),
-          hc_fn.data_ptr<float>(),
-          hc_scale_val,
-          hc_base.data_ptr<float>(),
-          T,
-          d,
-          static_cast<float>(hc_eps),
-          static_cast<float>(norm_eps));
-    } else if (x.scalar_type() == at::kFloat) {
-      hc_head_brgemm_fuse_impl<float, 4>(
-          y.data_ptr<float>(),
-          x.data_ptr<float>(),
-          hc_fn.data_ptr<float>(),
-          hc_scale_val,
-          hc_base.data_ptr<float>(),
-          T,
-          d,
-          static_cast<float>(hc_eps),
-          static_cast<float>(norm_eps));
-    } else {
-      TORCH_CHECK(false, "hc_head_fused_cpu: unexpected scalar_type");
-    }
-    return y;
-  }
+  // Small-T: fully fused split-K path (no intermediate tensors).
+  // Large-T: RMSnorm → at::mm (MKL SGEMM with optimal weight reuse) → combine.
+  constexpr int64_t kSmallTokenThreshold = 32;
 
-  auto f32_opts = at::TensorOptions().dtype(at::kFloat).device(x.device());
-  auto scaled_x = at::empty({T, hc_d}, f32_opts);
-  if (x.scalar_type() == at::kBFloat16) {
-    hc_pre_scale_splitk_impl<c10::BFloat16>(
-        scaled_x.data_ptr<float>(), x.data_ptr<c10::BFloat16>(), T, hc_d, static_cast<float>(norm_eps));
-  } else if (x.scalar_type() == at::kFloat) {
-    hc_pre_scale_splitk_impl<float>(
-        scaled_x.data_ptr<float>(), x.data_ptr<float>(), T, hc_d, static_cast<float>(norm_eps));
+  if (T < kSmallTokenThreshold) {
+    hc_head_splitk_fuse_impl<c10::BFloat16, 4>(
+        y.data_ptr<c10::BFloat16>(),
+        x.data_ptr<c10::BFloat16>(),
+        hc_fn.data_ptr<float>(),
+        hc_scale_val,
+        hc_base.data_ptr<float>(),
+        T,
+        d,
+        static_cast<float>(hc_eps),
+        static_cast<float>(norm_eps));
   } else {
-    TORCH_CHECK(false, "hc_head_fused_cpu: unexpected scalar_type");
-  }
+    // Phase A: RMSnorm scale → scaled_x [T, hc_d] float32
+    auto scaled_x = at::empty({T, hc_d}, at::TensorOptions().dtype(at::kFloat).device(x.device()));
+    hc_pre_scale_impl<c10::BFloat16>(
+        scaled_x.data_ptr<float>(), x.data_ptr<c10::BFloat16>(), T, hc_d, static_cast<float>(norm_eps));
 
-  auto mixes = at::mm(scaled_x, hc_fn.t());
-  if (x.scalar_type() == at::kBFloat16) {
+    // GEMM: mixes [T, HC] = scaled_x @ hc_fn.T  (dispatches to MKL SGEMM)
+    auto mixes = at::mm(scaled_x, hc_fn.t());
+
+    // Phase B: gate + combine → y
     hc_head_combine_impl<c10::BFloat16, 4>(
         y.data_ptr<c10::BFloat16>(),
-        mixes.contiguous().data_ptr<float>(),
+        mixes.data_ptr<float>(),
         x.data_ptr<c10::BFloat16>(),
         hc_scale_val,
         hc_base.data_ptr<float>(),
         T,
         d,
         static_cast<float>(hc_eps));
-  } else {
-    hc_head_combine_impl<float, 4>(
-        y.data_ptr<float>(),
-        mixes.contiguous().data_ptr<float>(),
-        x.data_ptr<float>(),
-        hc_scale_val,
-        hc_base.data_ptr<float>(),
-        T,
-        d,
-        static_cast<float>(hc_eps));
   }
+
   return y;
 }
