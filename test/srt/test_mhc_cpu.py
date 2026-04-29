@@ -919,16 +919,39 @@ class BenchmarkHelper:
         return mean_ms, std_ms, times
 
     @staticmethod
-    def report_benchmark(name, cpp_time_ms, py_time_ms, throughput_cpp, throughput_py):
+    def report_benchmark(
+        name,
+        cpp_time_ms,
+        py_time_ms,
+        throughput_cpp,
+        throughput_py,
+        compile_time_ms=None,
+    ):
         """Format and print a single benchmark result."""
         speedup = py_time_ms / cpp_time_ms if cpp_time_ms > 0 else 1.0
+        compile_str = (
+            f"Compile {compile_time_ms:7.3f}ms | "
+            if compile_time_ms is not None
+            else ""
+        )
         print(
             f"  {name:40s} | "
             f"C++ {cpp_time_ms:7.3f}ms | "
             f"PyTorch {py_time_ms:7.3f}ms | "
+            f"{compile_str}"
             f"Speedup {speedup:5.2f}x | "
             f"Throughput (C++/PyTorch): {throughput_cpp:7.1f}/{throughput_py:7.1f} elem/ms"
         )
+
+
+_COMPILED_CACHE: dict = {}
+
+
+def _get_compiled(fn):
+    """Return a cached torch.compile'd version of fn (compiled once per function)."""
+    if fn not in _COMPILED_CACHE:
+        _COMPILED_CACHE[fn] = torch.compile(fn)
+    return _COMPILED_CACHE[fn]
 
 
 def _bench_iters(T, d):
@@ -1040,11 +1063,29 @@ class BenchmarkHcPreCpu(unittest.TestCase):
                 self.HC_EPS,
             )
 
+        # Compiled PyTorch reference
+        compiled_ref_hc_pre = _get_compiled(_ref_hc_pre)
+
+        def run_compile():
+            compiled_ref_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.HC,
+                self.SINKHORN_ITERS,
+                self.RMS_EPS,
+                self.HC_EPS,
+            )
+
         cpp_time, cpp_std, _ = BenchmarkHelper.timeit(
             run_cpp, warmup_iters=warmup, measure_iters=measure
         )
         py_time, py_std, _ = BenchmarkHelper.timeit(
             run_py, warmup_iters=warmup, measure_iters=measure
+        )
+        compile_time, _, _ = BenchmarkHelper.timeit(
+            run_compile, warmup_iters=warmup, measure_iters=measure
         )
 
         # Throughput: input elements (x has T*hc*D elements)
@@ -1053,7 +1094,7 @@ class BenchmarkHcPreCpu(unittest.TestCase):
         throughput_py = total_elements / py_time
 
         BenchmarkHelper.report_benchmark(
-            description, cpp_time, py_time, throughput_cpp, throughput_py
+            description, cpp_time, py_time, throughput_cpp, throughput_py, compile_time
         )
 
     # def test_benchmark_sweep_fp32(self):
@@ -1105,11 +1146,20 @@ class BenchmarkHcPostCpu(unittest.TestCase):
         def run_py():
             _ref_hc_post(x, residual, post, comb)
 
+        # Compiled PyTorch reference
+        compiled_ref_hc_post = _get_compiled(_ref_hc_post)
+
+        def run_compile():
+            compiled_ref_hc_post(x, residual, post, comb)
+
         cpp_time, cpp_std, _ = BenchmarkHelper.timeit(
             run_cpp, warmup_iters=warmup, measure_iters=measure
         )
         py_time, py_std, _ = BenchmarkHelper.timeit(
             run_py, warmup_iters=warmup, measure_iters=measure
+        )
+        compile_time, _, _ = BenchmarkHelper.timeit(
+            run_compile, warmup_iters=warmup, measure_iters=measure
         )
 
         # Throughput: input elements (x is T*D, residual is T*HC*D)
@@ -1118,7 +1168,7 @@ class BenchmarkHcPostCpu(unittest.TestCase):
         throughput_py = total_elements / py_time
 
         BenchmarkHelper.report_benchmark(
-            description, cpp_time, py_time, throughput_cpp, throughput_py
+            description, cpp_time, py_time, throughput_cpp, throughput_py, compile_time
         )
 
     # def test_benchmark_sweep_fp32(self):
@@ -1181,11 +1231,22 @@ class BenchmarkHcHeadCpu(unittest.TestCase):
         def run_py():
             _ref_hc_head(x, hc_fn, hc_scale, hc_base, self.HC_EPS, self.NORM_EPS)
 
+        # Compiled PyTorch reference
+        compiled_ref_hc_head = _get_compiled(_ref_hc_head)
+
+        def run_compile():
+            compiled_ref_hc_head(
+                x, hc_fn, hc_scale, hc_base, self.HC_EPS, self.NORM_EPS
+            )
+
         cpp_time, cpp_std, _ = BenchmarkHelper.timeit(
             run_cpp, warmup_iters=warmup, measure_iters=measure
         )
         py_time, py_std, _ = BenchmarkHelper.timeit(
             run_py, warmup_iters=warmup, measure_iters=measure
+        )
+        compile_time, _, _ = BenchmarkHelper.timeit(
+            run_compile, warmup_iters=warmup, measure_iters=measure
         )
 
         # Throughput: input elements (x is T*HC*D)
@@ -1194,7 +1255,7 @@ class BenchmarkHcHeadCpu(unittest.TestCase):
         throughput_py = total_elements / py_time
 
         BenchmarkHelper.report_benchmark(
-            description, cpp_time, py_time, throughput_cpp, throughput_py
+            description, cpp_time, py_time, throughput_cpp, throughput_py, compile_time
         )
 
     # def test_benchmark_sweep_fp32(self):
