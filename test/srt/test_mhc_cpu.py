@@ -1128,6 +1128,90 @@ class BenchmarkHcPreCpu(unittest.TestCase):
                 )
 
 
+class BenchmarkHcPreLinearOnly(unittest.TestCase):
+    """Benchmark just the linear (GEMM) + rsqrt portion of hc_pre.
+
+    This gives the theoretical minimum time for the fused kernel,
+    since the linear is the dominant compute.
+    """
+
+    HC = 4
+    HIDDEN_SIZES = (4096, 7168)
+    RMS_EPS = 1e-5
+
+    def _run_benchmark(self, T, d, dtype, description, warmup=500, measure=500):
+        hc = self.HC
+        mix_hc = (2 + hc) * hc  # 24
+        hc_d = hc * d
+
+        x = torch.randn(T, hc, d, dtype=dtype)
+        x_flat = x.flatten(1).float()  # [T, hc_d]
+        hc_fn = torch.randn(mix_hc, hc_d, dtype=torch.float32) * 0.02
+
+        # Pre-compute rsqrt (cheap, not what we measure)
+        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.RMS_EPS)
+
+        # --- Bare linear only ---
+        def run_linear():
+            F.linear(x_flat, hc_fn)
+
+        # --- Linear + rsqrt multiply (what the fused kernel replaces) ---
+        def run_linear_rsqrt():
+            F.linear(x_flat, hc_fn) * rsqrt
+
+        # --- RMSnorm + linear (full GEMM portion) ---
+        def run_full_gemm():
+            r = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.RMS_EPS)
+            F.linear(x_flat, hc_fn) * r
+
+        # --- Weighted combine: y = sum_h pre_h * x_h ---
+        pre = torch.randn(T, hc, dtype=torch.float32).sigmoid()
+
+        def run_combine():
+            (pre.unsqueeze(-1) * x.float()).sum(dim=1)
+
+        linear_time, _, _ = BenchmarkHelper.timeit(
+            run_linear, warmup_iters=warmup, measure_iters=measure
+        )
+        linear_rsqrt_time, _, _ = BenchmarkHelper.timeit(
+            run_linear_rsqrt, warmup_iters=warmup, measure_iters=measure
+        )
+        full_gemm_time, _, _ = BenchmarkHelper.timeit(
+            run_full_gemm, warmup_iters=warmup, measure_iters=measure
+        )
+        combine_time, _, _ = BenchmarkHelper.timeit(
+            run_combine, warmup_iters=warmup, measure_iters=measure
+        )
+
+        print(
+            f"  {description:40s} | "
+            f"linear {linear_time:7.3f}ms | "
+            f"+rsqrt {linear_rsqrt_time:7.3f}ms | "
+            f"rmsnorm+linear {full_gemm_time:7.3f}ms | "
+            f"combine {combine_time:7.3f}ms | "
+            f"total_parts {full_gemm_time + combine_time:7.3f}ms"
+        )
+
+    def test_benchmark_sweep_bf16(self):
+        """Sweep T=1..2048: measure linear-only time as lower bound."""
+        print()
+        print(
+            "  (linear = F.linear only; +rsqrt = linear*rsqrt; "
+            "rmsnorm+linear = sq+rsqrt+linear; combine = weighted sum)"
+        )
+        for d in self.HIDDEN_SIZES:
+            for T in T_SWEEP:
+                w, m = _bench_iters(T, d)
+                self._run_benchmark(
+                    T,
+                    d,
+                    torch.bfloat16,
+                    description=f"hc_pre parts (T={T:4d}, D={d}, bf16)",
+                    warmup=w,
+                    measure=m,
+                )
+
+
 class BenchmarkHcPostCpu(unittest.TestCase):
     """Benchmark hc_post_cpu vs PyTorch reference."""
 
@@ -1563,4 +1647,57 @@ Sweep T=1..2048 (powers of two). ...
   hc_split_sinkhorn (T=1024)               | C++   3.890ms | PyTorch   3.894ms | Speedup  1.00x | Throughput (C++/PyTorch): 12634.3/12622.0 elem/ms
   hc_split_sinkhorn (T=2048)               | C++   4.980ms | PyTorch   4.997ms | Speedup  1.00x | Throughput (C++/PyTorch): 19739.8/19671.8 elem/ms
 ok
+
+
+  hc_pre (T=   1, D=4096, bf16)            | C++   0.147ms | PyTorch   0.763ms | Compile   0.280ms | Speedup  5.20x | Throughput (C++/PyTorch): 111578.1/21460.8 elem/ms
+  hc_pre (T=   2, D=4096, bf16)            | C++   0.162ms | PyTorch   0.760ms | Compile   0.585ms | Speedup  4.68x | Throughput (C++/PyTorch): 201650.3/43094.8 elem/ms
+  hc_pre (T=   4, D=4096, bf16)            | C++   0.170ms | PyTorch   0.905ms | Compile   0.682ms | Speedup  5.31x | Throughput (C++/PyTorch): 384639.0/72405.2 elem/ms
+  hc_pre (T=   8, D=4096, bf16)            | C++   0.180ms | PyTorch   1.009ms | Compile   0.745ms | Speedup  5.62x | Throughput (C++/PyTorch): 729422.2/129866.2 elem/ms
+  hc_pre (T=  16, D=4096, bf16)            | C++   0.188ms | PyTorch   0.877ms | Compile   0.524ms | Speedup  4.68x | Throughput (C++/PyTorch): 1397577.6/298820.9 elem/ms
+  hc_pre (T=  32, D=4096, bf16)            | C++   0.201ms | PyTorch   0.949ms | Compile   0.638ms | Speedup  4.73x | Throughput (C++/PyTorch): 2613066.0/552495.3 elem/ms
+  hc_pre (T=  64, D=4096, bf16)            | C++   0.262ms | PyTorch   1.100ms | Compile   0.914ms | Speedup  4.20x | Throughput (C++/PyTorch): 4002738.0/953257.0 elem/ms
+  hc_pre (T= 128, D=4096, bf16)            | C++   0.394ms | PyTorch   1.534ms | Compile   1.302ms | Speedup  3.89x | Throughput (C++/PyTorch): 5316061.4/1367023.5 elem/ms
+  hc_pre (T= 256, D=4096, bf16)            | C++   0.858ms | PyTorch   2.780ms | Compile   1.696ms | Speedup  3.24x | Throughput (C++/PyTorch): 4889296.7/1508719.5 elem/ms
+  hc_pre (T= 512, D=4096, bf16)            | C++   1.324ms | PyTorch   3.972ms | Compile   3.472ms | Speedup  3.00x | Throughput (C++/PyTorch): 6335493.7/2112138.2 elem/ms
+  hc_pre (T=1024, D=4096, bf16)            | C++   2.742ms | PyTorch   8.021ms | Compile   6.076ms | Speedup  2.92x | Throughput (C++/PyTorch): 6117975.9/2091659.3 elem/ms
+  hc_pre (T=2048, D=4096, bf16)            | C++   4.193ms | PyTorch  12.825ms | Compile  11.018ms | Speedup  3.06x | Throughput (C++/PyTorch): 8002316.4/2616398.8 elem/ms
+  hc_pre (T=   1, D=7168, bf16)            | C++   0.160ms | PyTorch   0.628ms | Compile   0.279ms | Speedup  3.92x | Throughput (C++/PyTorch): 179227.4/45665.4 elem/ms
+  hc_pre (T=   2, D=7168, bf16)            | C++   0.174ms | PyTorch   0.890ms | Compile   0.724ms | Speedup  5.13x | Throughput (C++/PyTorch): 330428.6/64425.0 elem/ms
+  hc_pre (T=   4, D=7168, bf16)            | C++   0.176ms | PyTorch   0.944ms | Compile   0.627ms | Speedup  5.37x | Throughput (C++/PyTorch): 652016.0/121445.8 elem/ms
+  hc_pre (T=   8, D=7168, bf16)            | C++   0.183ms | PyTorch   1.024ms | Compile   0.709ms | Speedup  5.59x | Throughput (C++/PyTorch): 1252472.1/223944.1 elem/ms
+  hc_pre (T=  16, D=7168, bf16)            | C++   0.204ms | PyTorch   0.912ms | Compile   0.629ms | Speedup  4.47x | Throughput (C++/PyTorch): 2250165.7/503073.0 elem/ms
+  hc_pre (T=  32, D=7168, bf16)            | C++   0.229ms | PyTorch   1.060ms | Compile   0.873ms | Speedup  4.63x | Throughput (C++/PyTorch): 4009878.8/865306.8 elem/ms
+  hc_pre (T=  64, D=7168, bf16)            | C++   0.363ms | PyTorch   1.257ms | Compile   1.216ms | Speedup  3.47x | Throughput (C++/PyTorch): 5059303.8/1459885.6 elem/ms
+  hc_pre (T= 128, D=7168, bf16)            | C++   0.776ms | PyTorch   1.902ms | Compile   1.404ms | Speedup  2.45x | Throughput (C++/PyTorch): 4730212.1/1929335.5 elem/ms
+  hc_pre (T= 256, D=7168, bf16)            | C++   1.262ms | PyTorch   2.961ms | Compile   2.223ms | Speedup  2.35x | Throughput (C++/PyTorch): 5817664.8/2479277.8 elem/ms
+  hc_pre (T= 512, D=7168, bf16)            | C++   2.430ms | PyTorch   5.507ms | Compile   4.878ms | Speedup  2.27x | Throughput (C++/PyTorch): 6041635.3/2665902.8 elem/ms
+  hc_pre (T=1024, D=7168, bf16)            | C++   3.938ms | PyTorch  11.067ms | Compile   8.850ms | Speedup  2.81x | Throughput (C++/PyTorch): 7456031.9/2652844.0 elem/ms
+  hc_pre (T=2048, D=7168, bf16)            | C++   5.025ms | PyTorch  21.025ms | Compile  22.111ms | Speedup  4.18x | Throughput (C++/PyTorch): 11686212.8/2792882.4 elem/ms
+
+    (linear = F.linear only; +rsqrt = linear*rsqrt; rmsnorm+linear = sq+rsqrt+linear; combine = weighted sum)
+  hc_pre parts (T=   1, D=4096, bf16)      | linear   0.091ms | +rsqrt   0.081ms | rmsnorm+linear   0.108ms | combine   0.029ms | total_parts   0.137ms
+  hc_pre parts (T=   2, D=4096, bf16)      | linear   0.055ms | +rsqrt   0.061ms | rmsnorm+linear   0.109ms | combine   0.074ms | total_parts   0.184ms
+  hc_pre parts (T=   4, D=4096, bf16)      | linear   0.089ms | +rsqrt   0.094ms | rmsnorm+linear   0.141ms | combine   0.088ms | total_parts   0.230ms
+  hc_pre parts (T=   8, D=4096, bf16)      | linear   0.133ms | +rsqrt   0.138ms | rmsnorm+linear   0.189ms | combine   0.113ms | total_parts   0.302ms
+  hc_pre parts (T=  16, D=4096, bf16)      | linear   0.062ms | +rsqrt   0.064ms | rmsnorm+linear   0.129ms | combine   0.153ms | total_parts   0.282ms
+  hc_pre parts (T=  32, D=4096, bf16)      | linear   0.074ms | +rsqrt   0.076ms | rmsnorm+linear   0.155ms | combine   0.120ms | total_parts   0.275ms
+  hc_pre parts (T=  64, D=4096, bf16)      | linear   0.095ms | +rsqrt   0.098ms | rmsnorm+linear   0.157ms | combine   0.131ms | total_parts   0.288ms
+  hc_pre parts (T= 128, D=4096, bf16)      | linear   0.180ms | +rsqrt   0.159ms | rmsnorm+linear   0.236ms | combine   0.161ms | total_parts   0.396ms
+  hc_pre parts (T= 256, D=4096, bf16)      | linear   0.392ms | +rsqrt   0.390ms | rmsnorm+linear   0.412ms | combine   0.194ms | total_parts   0.606ms
+  hc_pre parts (T= 512, D=4096, bf16)      | linear   0.898ms | +rsqrt   0.619ms | rmsnorm+linear   0.661ms | combine   0.433ms | total_parts   1.094ms
+  hc_pre parts (T=1024, D=4096, bf16)      | linear   1.778ms | +rsqrt   1.462ms | rmsnorm+linear   1.638ms | combine   1.040ms | total_parts   2.679ms
+  hc_pre parts (T=2048, D=4096, bf16)      | linear   2.582ms | +rsqrt   1.620ms | rmsnorm+linear   2.660ms | combine   3.254ms | total_parts   5.914ms
+  hc_pre parts (T=   1, D=7168, bf16)      | linear   0.031ms | +rsqrt   0.032ms | rmsnorm+linear   0.055ms | combine   0.038ms | total_parts   0.093ms
+  hc_pre parts (T=   2, D=7168, bf16)      | linear   0.105ms | +rsqrt   0.108ms | rmsnorm+linear   0.139ms | combine   0.080ms | total_parts   0.219ms
+  hc_pre parts (T=   4, D=7168, bf16)      | linear   0.189ms | +rsqrt   0.192ms | rmsnorm+linear   0.230ms | combine   0.104ms | total_parts   0.334ms
+  hc_pre parts (T=   8, D=7168, bf16)      | linear   0.262ms | +rsqrt   0.265ms | rmsnorm+linear   0.316ms | combine   0.131ms | total_parts   0.447ms
+  hc_pre parts (T=  16, D=7168, bf16)      | linear   0.069ms | +rsqrt   0.071ms | rmsnorm+linear   0.145ms | combine   0.165ms | total_parts   0.310ms
+  hc_pre parts (T=  32, D=7168, bf16)      | linear   0.086ms | +rsqrt   0.083ms | rmsnorm+linear   0.189ms | combine   0.149ms | total_parts   0.338ms
+  hc_pre parts (T=  64, D=7168, bf16)      | linear   0.148ms | +rsqrt   0.134ms | rmsnorm+linear   0.196ms | combine   0.143ms | total_parts   0.340ms
+  hc_pre parts (T= 128, D=7168, bf16)      | linear   0.337ms | +rsqrt   0.331ms | rmsnorm+linear   0.409ms | combine   0.196ms | total_parts   0.606ms
+  hc_pre parts (T= 256, D=7168, bf16)      | linear   0.596ms | +rsqrt   0.535ms | rmsnorm+linear   0.577ms | combine   0.348ms | total_parts   0.925ms
+  hc_pre parts (T= 512, D=7168, bf16)      | linear   1.225ms | +rsqrt   1.202ms | rmsnorm+linear   1.334ms | combine   0.859ms | total_parts   2.193ms
+  hc_pre parts (T=1024, D=7168, bf16)      | linear   2.898ms | +rsqrt   1.653ms | rmsnorm+linear   2.681ms | combine   2.477ms | total_parts   5.158ms
+  hc_pre parts (T=2048, D=7168, bf16)      | linear   3.358ms | +rsqrt   1.938ms | rmsnorm+linear   5.685ms | combine   7.927ms | total_parts  13.612ms
+
 """
