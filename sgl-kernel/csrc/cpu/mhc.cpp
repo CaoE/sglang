@@ -21,17 +21,19 @@ limitations under the License.
 //   hc_head_fused_cpu  – full hc_head: RMSnorm + GEMM + sigmoid gates + combine
 //
 // Data type contract:
-//   * Data tensors (x, residual, y, out): bf16 (typical) or float32.
+//   * Data tensors (x, residual, y, out): bf16 only.
 //   * Coefficient tensors (post, comb, hc_fn, hc_scale, hc_base): always float32.
-//   * Internal GEMM intermediate (scaled_x): always float32.
-//   * All arithmetic performed in float32; results converted back to input dtype.
+//   * Internal reductions, dot products, and accumulators use float32.
+//   * All arithmetic performed in float32; results converted back to bf16.
 //   * hc_mult=4 required (DeepSeek V4 default).
-//   * GEMM delegated to at::mm (MKL/OpenBLAS).
+//   * MHC projections are computed by fused tiny-GEMM loops; no scaled_x or
+//     at::mm intermediate is materialized.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <ATen/record_function.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -40,6 +42,56 @@ limitations under the License.
 #include "vec.h"
 
 namespace {
+
+// Heuristics for the fused MHC loops.  Keep the active weight tile plus the
+// converted-x cache near a private-cache working set, and keep the Phase 3
+// accumulator tile around a few KiB per worker.  Values are derived from bytes
+// and SIMD width instead of hard-coding per-kernel K/D block sizes.
+constexpr int64_t kMhcTileCacheBudgetBytes = 36 * 1024;
+constexpr int64_t kMhcScratchTargetBytes = 2 * 1024;
+constexpr int64_t kMhcDefaultTokenBlock = 32;
+constexpr int64_t kMhcMinDVecs = 8;
+constexpr int64_t kMhcMaxDVecs = 32;
+
+inline int64_t round_to_multiple(int64_t value, int64_t multiple) {
+  return ((value + multiple / 2) / multiple) * multiple;
+}
+
+inline int64_t choose_t_block(int64_t /*T*/) {
+  // Token blocking primarily controls weight-tile reuse.  32 tokens amortizes
+  // weight loads well while keeping partials compact; Phase 1 dispatch below
+  // decides whether to split K or use pure token-block parallelism.
+  return kMhcDefaultTokenBlock;
+}
+
+inline int64_t choose_k_block(int64_t weight_rows, int64_t vec_size, int64_t max_block) {
+  const int64_t bytes_per_k = (weight_rows + 1) * static_cast<int64_t>(sizeof(float));
+  const int64_t raw = std::max(vec_size, kMhcTileCacheBudgetBytes / bytes_per_k);
+  const int64_t grain = std::max<int64_t>(vec_size, 2 * vec_size);
+  const int64_t rounded = round_to_multiple(raw, grain);
+  return std::max(vec_size, std::min(max_block, rounded));
+}
+
+inline int64_t choose_d_block(int64_t vec_size) {
+  const int64_t target_elems = kMhcScratchTargetBytes / static_cast<int64_t>(sizeof(float));
+  const int64_t min_elems = kMhcMinDVecs * vec_size;
+  const int64_t max_elems = kMhcMaxDVecs * vec_size;
+  const int64_t rounded = round_to_multiple(target_elems, vec_size);
+  return std::max(min_elems, std::min(max_elems, rounded));
+}
+
+template <typename func_t>
+inline void parallel_mhc_phase1(int64_t n_t_blocks, int64_t n_k_blocks, const func_t& f) {
+  const int64_t nth = static_cast<int64_t>(at::get_num_threads());
+  if (n_t_blocks >= nth) {
+    // Large prefill: enough token blocks exist to fill all workers.  Avoid
+    // splitting K so Phase 2 does not pay unnecessary partial-reduce overhead.
+    parallel_2d_tiled(static_cast<int>(n_t_blocks), static_cast<int>(n_k_blocks), static_cast<int>(nth), 1, f);
+  } else {
+    // Decode / small T: split both T and K to expose enough parallel tasks.
+    parallel_2d(static_cast<int>(n_t_blocks), static_cast<int>(n_k_blocks), f);
+  }
+}
 
 // In-place Sinkhorn normalization on a flat [HC*HC] float32 array (row-major).
 //
@@ -138,334 +190,8 @@ inline void parse_mixes_and_sinkhorn(
   sinkhorn_inplace<HC>(cm, sinkhorn_iters, eps);
 }
 
-// ---------------------------------------------------------------------------
-// hc_pre_scale_impl<scalar_t>
-// Pass A: RMSnorm per token on x[T, hc_d], write float32 scaled_x[T, hc_d].
-// scalar_t is bf16 or float32; scaled_x is always float32 for GEMM.
-//
-// Uses 4-way unrolled sq accumulation for ILP (4 independent FMA chains).
-// ---------------------------------------------------------------------------
-template <typename scalar_t>
-static void hc_pre_scale_impl(
-    float* __restrict__ scaled_x,    // [T, hc_d]  float32 output
-    const scalar_t* __restrict__ x,  // [T, hc_d]  input (bf16 or float32)
-    int64_t T,
-    int64_t hc_d,
-    float rms_eps) {
-  static_assert(std::is_same_v<scalar_t, c10::BFloat16>, "hc_pre_scale_impl: only bf16 is supported");
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t kVecSize = bVec::size();   // 32 bf16
-  constexpr int64_t kFVecSize = fVec::size();  // 16 fp32
-  // 4-way unroll: each bVec produces 2 fVec, so 4 bVec = 8 fVec = 4 sq chains
-  constexpr int64_t KU = 4;
-  constexpr int64_t STEP = KU * kVecSize;  // 128 bf16 elements per main-loop iter
-
-  at::parallel_for(0, T, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t t = begin; t < end; ++t) {
-      const scalar_t* x_t = x + t * hc_d;
-      float* sx_t = scaled_x + t * hc_d;
-
-      // Pass 1: sq with 4 independent accumulator chains
-      fVec sq0(0.f), sq1(0.f), sq2(0.f), sq3(0.f);
-      fVec x0, x1;
-      int64_t k = 0;
-      for (; k <= hc_d - STEP; k += STEP) {
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        sq0 += x0 * x0 + x1 * x1;
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k + kVecSize));
-        sq1 += x0 * x0 + x1 * x1;
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k + 2 * kVecSize));
-        sq2 += x0 * x0 + x1 * x1;
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k + 3 * kVecSize));
-        sq3 += x0 * x0 + x1 * x1;
-      }
-      fVec sq_acc = (sq0 + sq1) + (sq2 + sq3);
-      for (; k <= hc_d - kVecSize; k += kVecSize) {
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        sq_acc += x0 * x0 + x1 * x1;
-      }
-      if (k < hc_d) {
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, hc_d - k));
-        sq_acc += x0 * x0 + x1 * x1;
-      }
-
-      const double sum_sq = static_cast<double>(vec_reduce_sum(sq_acc));
-      const float rsqrt =
-          static_cast<float>(1.0 / std::sqrt(sum_sq / static_cast<double>(hc_d) + static_cast<double>(rms_eps)));
-      const fVec rsqrt_fvec(rsqrt);
-
-      // Pass 2: scale and store to float32 output
-      for (k = 0; k <= hc_d - kVecSize; k += kVecSize) {
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        (x0 * rsqrt_fvec).store(sx_t + k);
-        (x1 * rsqrt_fvec).store(sx_t + k + kFVecSize);
-      }
-      if (k < hc_d) {
-        const int64_t rem = hc_d - k;
-        const int64_t rem0 = std::min(rem, (int64_t)kFVecSize);
-        const int64_t rem1 = rem - rem0;
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-        (x0 * rsqrt_fvec).store(sx_t + k, rem0);
-        if (rem1 > 0) (x1 * rsqrt_fvec).store(sx_t + k + kFVecSize, rem1);
-      }
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// hc_pre_scale_splitk_impl<scalar_t>
-// Small-token path: split K (hc_d) across threads for better parallelism.
-//
-// Phase 1 (parallel over T*K_SPLITS): compute partial sq_sum per (token, k-split)
-// Phase 2 (parallel over T):          reduce partials → per-token inv_rms
-// Phase 3 (parallel over T*K_SPLITS): scale x → scaled_x using inv_rms
-//
-// Unlike hc_pre_scale_impl (which parallels over T only), this function exposes
-// T*K_SPLITS parallel tasks, saturating more cores when T is small (e.g. decode).
-// ---------------------------------------------------------------------------
-template <typename scalar_t>
-static void hc_pre_scale_splitk_impl(
-    float* __restrict__ scaled_x,    // [T, hc_d] float32 output
-    const scalar_t* __restrict__ x,  // [T, hc_d] input (bf16 or float32)
-    int64_t T,
-    int64_t hc_d,
-    float rms_eps) {
-  static_assert(std::is_same_v<scalar_t, c10::BFloat16>, "hc_pre_scale_splitk_impl: only bf16 is supported");
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t kVecSize = bVec::size();
-
-  // Split hc_d into K_SPLITS chunks: aim for ≥ num_threads tasks total (T * K_SPLITS).
-  // Each chunk must be at least kVecSize elements for SIMD to be effective.
-  const int64_t nthreads = at::get_num_threads();
-  const int64_t max_splits = std::max(int64_t(1), hc_d / kVecSize);
-  const int64_t K_SPLITS = std::min(nthreads, max_splits);
-  const int64_t k_chunk = (hc_d + K_SPLITS - 1) / K_SPLITS;  // ceil-div
-
-  // Phase 1: partial sq_sum[T * K_SPLITS] (parallel over T * K_SPLITS)
-  std::vector<double> partial_sq(static_cast<size_t>(T * K_SPLITS), 0.0);
-  at::parallel_for(0, T * K_SPLITS, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t idx = begin; idx < end; ++idx) {
-      const int64_t t = idx / K_SPLITS;
-      const int64_t ks = idx % K_SPLITS;
-      const int64_t k0 = ks * k_chunk;
-      const int64_t k1 = std::min(k0 + k_chunk, hc_d);
-      const scalar_t* x_t = x + t * hc_d;
-
-      fVec sq_acc(0.f);
-      int64_t k;
-      for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
-        fVec x0v, x1v;
-        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        sq_acc += x0v * x0v + x1v * x1v;
-      }
-      if (k < k1) {
-        fVec x0v, x1v;
-        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k, k1 - k));
-        sq_acc += x0v * x0v + x1v * x1v;
-      }
-      partial_sq[static_cast<size_t>(idx)] = static_cast<double>(vec_reduce_sum(sq_acc));
-    }
-  });
-
-  // Phase 2: reduce partials → inv_rms[T].
-  // Serial: T <= kSmallTokenThreshold (≤8) and K_SPLITS ≈ nthreads (64-128),
-  // so total work is ≤ 8 * 128 = 1024 scalar adds — parallel overhead not worth it.
-  std::vector<float> inv_rms(static_cast<size_t>(T));
-  for (int64_t t = 0; t < T; ++t) {
-    double sum_sq = 0.0;
-    for (int64_t ks = 0; ks < K_SPLITS; ++ks)
-      sum_sq += partial_sq[static_cast<size_t>(t * K_SPLITS + ks)];
-    inv_rms[static_cast<size_t>(t)] =
-        static_cast<float>(1.0 / std::sqrt(sum_sq / static_cast<double>(hc_d) + static_cast<double>(rms_eps)));
-  }
-
-  // Phase 3: scale x → scaled_x (parallel over T * K_SPLITS)
-  at::parallel_for(0, T * K_SPLITS, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t idx = begin; idx < end; ++idx) {
-      const int64_t t = idx / K_SPLITS;
-      const int64_t ks = idx % K_SPLITS;
-      const int64_t k0 = ks * k_chunk;
-      const int64_t k1 = std::min(k0 + k_chunk, hc_d);
-      const scalar_t* x_t = x + t * hc_d;
-      float* sx_t = scaled_x + t * hc_d;
-      const float irms = inv_rms[static_cast<size_t>(t)];
-      const fVec irms_vec(irms);
-
-      int64_t k;
-      for (k = k0; k <= k1 - kVecSize; k += kVecSize) {
-        fVec x0v, x1v;
-        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        (x0v * irms_vec).store(sx_t + k);
-        (x1v * irms_vec).store(sx_t + k + (int64_t)fVec::size());
-      }
-      if (k < k1) {
-        const int64_t rem = k1 - k;
-        fVec x0v, x1v;
-        std::tie(x0v, x1v) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-        const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-        const int64_t rem1 = rem - rem0;
-        (x0v * irms_vec).store(sx_t + k, rem0);
-        if (rem1 > 0) (x1v * irms_vec).store(sx_t + k + fVec::size(), rem1);
-      }
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// hc_pre_combine_impl<scalar_t, HC>
-// Pass B: mixes[T, mix_hc] + x[T, HC, d] → y[T,d], post[T,HC], comb[T,HC*HC]
-// y is same dtype as x (bf16 or float32); post and comb are always float32.
-// ---------------------------------------------------------------------------
 template <typename scalar_t, int HC>
-static void hc_pre_combine_impl(
-    scalar_t* __restrict__ y,         // [T, d]      output
-    float* __restrict__ post_out,     // [T, HC]     float32 output
-    float* __restrict__ comb_out,     // [T, HC*HC]  float32 output
-    const float* __restrict__ mixes,  // [T, mix_hc] float32 input
-    const scalar_t* __restrict__ x,   // [T, HC, d]  input
-    const float* __restrict__ hc_scale,
-    const float* __restrict__ hc_base,
-    int64_t T,
-    int64_t d,
-    int sinkhorn_iters,
-    float hc_eps) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  constexpr int mix_hc = (2 + HC) * HC;
-  const float s0 = hc_scale[0], s1 = hc_scale[1], s2 = hc_scale[2];
-
-  at::parallel_for(0, T, 0, [&](int64_t begin, int64_t end) {
-    alignas(64) float pre[HC];
-    alignas(64) float cm[HC * HC];
-
-    for (int64_t t = begin; t < end; ++t) {
-      const float* m = mixes + t * mix_hc;
-      float* po = post_out + t * HC;
-      float* co = comb_out + t * HC * HC;
-
-      parse_mixes_and_sinkhorn<HC>(pre, po, cm, m, s0, s1, s2, hc_base, sinkhorn_iters, hc_eps);
-      for (int i = 0; i < HC * HC; ++i)
-        co[i] = cm[i];
-
-      fVec pre_fvec[HC];
-      for (int h = 0; h < HC; ++h)
-        pre_fvec[h] = fVec(pre[h]);
-
-      const scalar_t* x_t = x + t * HC * d;
-      scalar_t* y_t = y + t * d;
-
-      int64_t k;
-      // bf16: convert and accumulate
-      for (k = 0; k <= d - kVecSize; k += kVecSize) {
-        fVec acc0, acc1;
-        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        acc0 *= pre_fvec[0];
-        acc1 *= pre_fvec[0];
-        for (int h = 1; h < HC; ++h) {
-          fVec f0, f1;
-          std::tie(f0, f1) = at::vec::convert_to_float(bVec::loadu(x_t + h * d + k));
-          acc0 += f0 * pre_fvec[h];
-          acc1 += f1 * pre_fvec[h];
-        }
-        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(y_t + k);
-      }
-      if (k < d) {
-        const int64_t rem = d - k;
-        fVec acc0, acc1;
-        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-        acc0 *= pre_fvec[0];
-        acc1 *= pre_fvec[0];
-        for (int h = 1; h < HC; ++h) {
-          fVec f0, f1;
-          std::tie(f0, f1) = at::vec::convert_to_float(bVec::loadu(x_t + h * d + k, rem));
-          acc0 += f0 * pre_fvec[h];
-          acc1 += f1 * pre_fvec[h];
-        }
-        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(y_t + k, rem);
-      }
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// hc_post_impl<scalar_t, HC>
-// out[t,h,k] = post[t,h]*x[t,k] + sum_i comb[t,i,h]*residual[t,i,k]
-// x and residual are bf16 or float32; post and comb are float32.
-// ---------------------------------------------------------------------------
-template <typename scalar_t, int HC>
-static void hc_post_impl(
-    scalar_t* __restrict__ out,             // [T, HC, d]  output
-    const scalar_t* __restrict__ x,         // [T, d]      input
-    const scalar_t* __restrict__ residual,  // [T, HC, d]  input
-    const float* __restrict__ post,         // [T, HC]     float32
-    const float* __restrict__ comb,         // [T, HC, HC] float32 row-major
-    int64_t T,
-    int64_t d) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  at::parallel_for(0, T * HC, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t idx = begin; idx < end; ++idx) {
-      const int64_t t = idx / HC;
-      const int h = static_cast<int>(idx % HC);
-
-      const float post_val = post[t * HC + h];
-      const float* comb_t = comb + t * HC * HC;
-      const scalar_t* x_t = x + t * d;
-      const scalar_t* res_t = residual + t * HC * d;
-      scalar_t* out_th = out + (t * HC + h) * d;
-
-      fVec post_fvec(post_val);
-      fVec comb_fvec[HC];
-      for (int i = 0; i < HC; ++i)
-        comb_fvec[i] = fVec(comb_t[i * HC + h]);
-
-      int64_t k;
-      // bf16: convert and accumulate
-      for (k = 0; k <= d - kVecSize; k += kVecSize) {
-        fVec acc0, acc1;
-        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        acc0 = post_fvec * acc0;
-        acc1 = post_fvec * acc1;
-        for (int i = 0; i < HC; ++i) {
-          fVec r0, r1;
-          std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k));
-          acc0 += comb_fvec[i] * r0;
-          acc1 += comb_fvec[i] * r1;
-        }
-        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k);
-      }
-      if (k < d) {
-        const int64_t rem = d - k;
-        fVec acc0, acc1;
-        std::tie(acc0, acc1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-        acc0 = post_fvec * acc0;
-        acc1 = post_fvec * acc1;
-        for (int i = 0; i < HC; ++i) {
-          fVec r0, r1;
-          std::tie(r0, r1) = at::vec::convert_to_float(bVec::loadu(res_t + i * d + k, rem));
-          acc0 += comb_fvec[i] * r0;
-          acc1 += comb_fvec[i] * r1;
-        }
-        at::vec::convert_from_float<scalar_t>(acc0, acc1).store(out_th + k, rem);
-      }
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// hc_post_splitk_impl<scalar_t, HC>
-// Same formula as hc_post_impl but parallelised over T * HC * K_SPLITS.
-// Each output element out[t,h,k] is fully independent, so k can be split
-// without any reduction step – unlike the RMSnorm sq-sum case.
-// Used when T*HC is small (e.g. decode: T=1 → only 4 tasks in hc_post_impl).
-// ---------------------------------------------------------------------------
-template <typename scalar_t, int HC>
-static void hc_post_splitk_impl(
+static void hc_post_fuse_impl(
     scalar_t* __restrict__ out,             // [T, HC, d]  output
     const scalar_t* __restrict__ x,         // [T, d]      input
     const scalar_t* __restrict__ residual,  // [T, HC, d]  input
@@ -479,7 +205,8 @@ static void hc_post_splitk_impl(
 
   const int64_t nthreads = at::get_num_threads();
   const int64_t max_splits = std::max(int64_t(1), d / kVecSize);
-  const int64_t K_SPLITS = std::min(nthreads, max_splits);
+  const int64_t token_head_tasks = T * HC;
+  const int64_t K_SPLITS = (token_head_tasks >= nthreads) ? int64_t(1) : std::min(nthreads, max_splits);
   const int64_t k_chunk = (d + K_SPLITS - 1) / K_SPLITS;
 
   at::parallel_for(0, T * HC * K_SPLITS, 0, [&](int64_t begin, int64_t end) {
@@ -536,738 +263,19 @@ static void hc_post_splitk_impl(
 }
 
 // ---------------------------------------------------------------------------
-// hc_head_gemm_fuse_impl<scalar_t, HC>
-// Fully fused hc_head path (large-T focused):
-//   1) token-wise rms (inv_rms)
-//   2) tiny GEMM (N=HC=4): mixes_raw[t,h] = dot(x_flat[t,:], hc_fn[h,:])
-//   3) gate: pre[h] = sigmoid((mixes_raw[h] * inv_rms) * hc_scale + hc_base[h]) + hc_eps
-//   4) combine: y[t,:] = sum_h pre[h] * x[t,h,:]
-//
-// Compared with the old path, this avoids materialising scaled_x[T, HC*d]
-// and removes an extra large read/write pass over x for prefill workloads.
-// ---------------------------------------------------------------------------
-template <typename scalar_t, int HC>
-static void hc_head_gemm_fuse_impl(
-    scalar_t* __restrict__ y,         // [T, d]      output
-    const scalar_t* __restrict__ x,   // [T, HC, d]  input
-    const float* __restrict__ hc_fn,  // [HC, HC*d]  float32
-    float hc_scale_val,
-    const float* __restrict__ hc_base,  // [HC]
-    int64_t T,
-    int64_t d,
-    float hc_eps,
-    float norm_eps) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const int64_t hc_d = HC * d;
-
-  at::parallel_for(0, T, 0, [&](int64_t begin, int64_t end) {
-    std::vector<float> scratch(d);
-    float* sc = scratch.data();
-
-    for (int64_t t = begin; t < end; ++t) {
-      const scalar_t* x_t = x + t * hc_d;
-      scalar_t* y_t = y + t * d;
-
-      // Pass 1: rms + tiny gemm (4 output channels) over flattened [HC*d].
-      fVec sq_acc(0.f);
-      fVec dot_acc[HC] = {fVec(0.f), fVec(0.f), fVec(0.f), fVec(0.f)};
-
-      // Pass 1: rms + dot-products over flattened [HC*d], bf16 input.
-      int64_t k = 0;
-      for (; k <= hc_d - kVecSize; k += kVecSize) {
-        fVec x0, x1;
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-        sq_acc += x0 * x0 + x1 * x1;
-        for (int h = 0; h < HC; ++h) {
-          const float* w = hc_fn + h * hc_d + k;
-          dot_acc[h] += x0 * fVec::loadu(w);
-          dot_acc[h] += x1 * fVec::loadu(w + (int64_t)fVec::size());
-        }
-      }
-      if (k < hc_d) {
-        const int64_t rem = hc_d - k;
-        fVec x0, x1;
-        std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_t + k, rem));
-        sq_acc += x0 * x0 + x1 * x1;
-        const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-        const int64_t rem1 = rem - rem0;
-        for (int h = 0; h < HC; ++h) {
-          const float* w = hc_fn + h * hc_d + k;
-          dot_acc[h] += x0 * fVec::loadu(w, rem0);
-          if (rem1 > 0) dot_acc[h] += x1 * fVec::loadu(w + (int64_t)fVec::size(), rem1);
-        }
-      }
-
-      const double sum_sq = static_cast<double>(vec_reduce_sum(sq_acc));
-      const float inv_rms =
-          static_cast<float>(1.0 / std::sqrt(sum_sq / static_cast<double>(hc_d) + static_cast<double>(norm_eps)));
-
-      float pre[HC];
-      for (int h = 0; h < HC; ++h) {
-        const float mix_h = static_cast<float>(vec_reduce_sum(dot_acc[h])) * inv_rms;
-        const float gate_in = mix_h * hc_scale_val + hc_base[h];
-        pre[h] = 1.f / (1.f + std::exp(-gate_in)) + hc_eps;
-      }
-
-      // Pass 2: h-outer combine, bf16 path: accumulate into fp32 scratch, then convert.
-      std::memset(sc, 0, d * sizeof(float));
-      for (int h = 0; h < HC; ++h) {
-        const fVec pre_fvec(pre[h]);
-        const scalar_t* x_th = x_t + h * d;
-        int64_t kk = 0;
-        for (; kk <= d - kVecSize; kk += kVecSize) {
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
-          (fVec::loadu(sc + kk) + pre_fvec * x0).store(sc + kk);
-          (fVec::loadu(sc + kk + (int64_t)fVec::size()) + pre_fvec * x1).store(sc + kk + (int64_t)fVec::size());
-        }
-        if (kk < d) {
-          const int64_t rem = d - kk;
-          fVec x0, x1;
-          std::tie(x0, x1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
-          const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-          const int64_t rem1 = rem - rem0;
-          (fVec::loadu(sc + kk, rem0) + pre_fvec * x0).store(sc + kk, rem0);
-          if (rem1 > 0)
-            (fVec::loadu(sc + kk + (int64_t)fVec::size(), rem1) + pre_fvec * x1)
-                .store(sc + kk + (int64_t)fVec::size(), rem1);
-        }
-      }
-
-      // Convert fp32 accumulator → bf16 output
-      int64_t kk = 0;
-      for (; kk <= d - kVecSize; kk += kVecSize) {
-        at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + kk), fVec::loadu(sc + kk + (int64_t)fVec::size()))
-            .store(y_t + kk);
-      }
-      if (kk < d) {
-        const int64_t rem = d - kk;
-        const int64_t rem0 = std::min(rem, (int64_t)fVec::size());
-        const int64_t rem1 = rem - rem0;
-        at::vec::convert_from_float<scalar_t>(
-            fVec::loadu(sc + kk, rem0), rem1 > 0 ? fVec::loadu(sc + kk + (int64_t)fVec::size(), rem1) : fVec(0.f))
-            .store(y_t + kk, rem);
-      }
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// hc_head_splitk_fuse_impl<scalar_t, HC>
-// Small-T fused path that saturates ~40 threads even for T=1.
-//
-// Problem: for T=1 the large-T path (grain=1 over T) only spawns 1 task,
-// leaving 39 threads idle.  This version splits the K=HC*d dimension so
-// that T × n_k_blocks tasks fill all threads in Phase 1.
-//
-// Three-phase structure (two parallel_for + one barrier between them):
-//
-//   Phase 1 – parallel over T × n_k_blocks (grain=1):
-//     Each task processes a [k0, k1) slice of the flattened input.
-//     Produces partials: partial_sq[t,kb] and partial_dot[t,kb,HC].
-//
-//   Phase 2 – parallel over T (grain=1):
-//     Reduce partials → inv_rms, apply sigmoid gate → pre[t, HC].
-//
-//   Phase 3 – parallel over T × n_d_blocks (grain=1):
-//     h-outer combine: y[t, k0:k1] = Σ_h pre[t,h] * x[t,h, k0:k1].
-//     d is split into the same block size as K so both phases saturate threads.
-//
-// Memory layout of partials:
-//   partials[(t * n_k_blocks + kb) * (1 + HC)]
-//     [0]       = partial sq_acc (float)
-//     [1..HC]   = partial dot_acc[h] (float, h=0..HC-1)
-// ---------------------------------------------------------------------------
-template <typename scalar_t, int HC>
-static void hc_head_splitk_fuse_impl(
-    scalar_t* __restrict__ y,         // [T, d]
-    const scalar_t* __restrict__ x,   // [T, HC, d]
-    const float* __restrict__ hc_fn,  // [HC, HC*d]  row-major
-    float hc_scale_val,
-    const float* __restrict__ hc_base,  // [HC]
-    int64_t T,
-    int64_t d,
-    float hc_eps,
-    float norm_eps) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t kVecSize = bVec::size();
-  constexpr int64_t kFVecSize = fVec::size();  // 16 floats (AVX512)
-  const int64_t hc_d = HC * d;
-
-  // Block size: 512 floats = 2KB per K-block.  Each Phase-1 task reads the
-  // block from x (2KB) plus HC weight slices (HC*2KB=8KB) — fits in L1 cache.
-  constexpr int64_t K_BLOCK = 512;
-  const int64_t n_k_blocks = div_up(hc_d, K_BLOCK);
-  const int64_t n_d_blocks = div_up(d, K_BLOCK);
-
-  // partials[t, kb, 1+HC]  (sq + HC dot products)
-  constexpr int64_t partial_stride = 1 + HC;
-  std::vector<float> partials(static_cast<size_t>(T * n_k_blocks * partial_stride), 0.f);
-  std::vector<float> pre_buf(static_cast<size_t>(T * HC));
-
-  // ── Phase 1: T × n_k_blocks tasks ────────────────────────────────────────
-  at::parallel_for(0, T * n_k_blocks, 1, [&](int64_t begin, int64_t end) {
-    // Per-thread upcast scratch: 512 f32 = 2 KB — stays in L1 across all heads.
-    float a_float[K_BLOCK];
-    for (int64_t idx = begin; idx < end; ++idx) {
-      const int64_t t = idx / n_k_blocks;
-      const int64_t kb = idx % n_k_blocks;
-      const int64_t k0 = kb * K_BLOCK;
-      const int64_t len = std::min(K_BLOCK, hc_d - k0);
-
-      const scalar_t* a = x + t * hc_d + k0;
-      float* p = partials.data() + (t * n_k_blocks + kb) * partial_stride;
-
-      // Step 1: upcast bf16 → float once into a_float (contiguous write).
-      {
-        int64_t k = 0;
-        for (; k <= len - kVecSize; k += kVecSize) {
-          fVec xf0, xf1;
-          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(a + k));
-          xf0.store(a_float + k);
-          xf1.store(a_float + k + kFVecSize);
-        }
-        if (k < len) {
-          const int64_t rem = len - k;
-          const int64_t rem0 = std::min(rem, kFVecSize);
-          const int64_t rem1 = rem - rem0;
-          fVec xf0, xf1;
-          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(a + k, rem));
-          xf0.store(a_float + k, rem0);
-          if (rem1 > 0) xf1.store(a_float + k + kFVecSize, rem1);
-        }
-      }
-
-      // Step 2: sq — KU=4 unrolled float loop on a_float.
-      {
-        constexpr int64_t STEP = 4 * kFVecSize;
-        fVec sq_u[4] = {fVec(0.f), fVec(0.f), fVec(0.f), fVec(0.f)};
-        int64_t k = 0;
-        for (; k <= len - STEP; k += STEP) {
-          const fVec x0 = fVec::loadu(a_float + k);
-          const fVec x1 = fVec::loadu(a_float + k + kFVecSize);
-          const fVec x2 = fVec::loadu(a_float + k + 2 * kFVecSize);
-          const fVec x3 = fVec::loadu(a_float + k + 3 * kFVecSize);
-          sq_u[0] += x0 * x0;
-          sq_u[1] += x1 * x1;
-          sq_u[2] += x2 * x2;
-          sq_u[3] += x3 * x3;
-        }
-        fVec sq_acc = (sq_u[0] + sq_u[1]) + (sq_u[2] + sq_u[3]);
-        for (; k <= len - kFVecSize; k += kFVecSize) {
-          const fVec xf = fVec::loadu(a_float + k);
-          sq_acc += xf * xf;
-        }
-        if (k < len) {
-          const fVec xf = fVec::loadu(a_float + k, len - k);
-          sq_acc += xf * xf;
-        }
-        p[0] = vec_reduce_sum(sq_acc);
-      }
-
-      // Step 3: dot — h-outer KU=4 float loop; each head streams its weight
-      // row contiguously (hc_fn[h][k0..k0+len]), no inter-head strides.
-      for (int h = 0; h < HC; ++h) {
-        const float* w = hc_fn + h * hc_d + k0;
-        constexpr int64_t STEP = 4 * kFVecSize;
-        fVec dot_u[4] = {fVec(0.f), fVec(0.f), fVec(0.f), fVec(0.f)};
-        int64_t k = 0;
-        for (; k <= len - STEP; k += STEP) {
-          dot_u[0] += fVec::loadu(a_float + k) * fVec::loadu(w + k);
-          dot_u[1] += fVec::loadu(a_float + k + kFVecSize) * fVec::loadu(w + k + kFVecSize);
-          dot_u[2] += fVec::loadu(a_float + k + 2 * kFVecSize) * fVec::loadu(w + k + 2 * kFVecSize);
-          dot_u[3] += fVec::loadu(a_float + k + 3 * kFVecSize) * fVec::loadu(w + k + 3 * kFVecSize);
-        }
-        fVec dot_acc = (dot_u[0] + dot_u[1]) + (dot_u[2] + dot_u[3]);
-        for (; k <= len - kFVecSize; k += kFVecSize) {
-          dot_acc += fVec::loadu(a_float + k) * fVec::loadu(w + k);
-        }
-        if (k < len) {
-          dot_acc += fVec::loadu(a_float + k, len - k) * fVec::loadu(w + k, len - k);
-        }
-        p[1 + h] = vec_reduce_sum(dot_acc);
-      }
-    }
-  });
-
-  // ── Phase 2: reduce + gate (serial) ──────────────────────────────────────
-  // Work = T × n_k_blocks × (1 + HC) floats ≈ 32 × 32 × 5 = 5120 ops at most.
-  // Parallelising this would cost more in thread-scheduling overhead than it
-  // saves, so we simply run it in the caller thread.
-  for (int64_t t = 0; t < T; ++t) {
-    double sq_total = 0.0;
-    float dot_total[HC] = {};
-    for (int64_t kb = 0; kb < n_k_blocks; ++kb) {
-      const float* p = partials.data() + (t * n_k_blocks + kb) * partial_stride;
-      sq_total += static_cast<double>(p[0]);
-      for (int h = 0; h < HC; ++h)
-        dot_total[h] += p[1 + h];
-    }
-    const float inv_rms =
-        static_cast<float>(1.0 / std::sqrt(sq_total / static_cast<double>(hc_d) + static_cast<double>(norm_eps)));
-    float* pre = pre_buf.data() + t * HC;
-    for (int h = 0; h < HC; ++h) {
-      const float gate_in = dot_total[h] * inv_rms * hc_scale_val + hc_base[h];
-      pre[h] = 1.f / (1.f + std::exp(-gate_in)) + hc_eps;
-    }
-  }
-
-  // ── Phase 3: h-outer combine, T × n_d_blocks tasks ───────────────────────
-  at::parallel_for(0, T * n_d_blocks, 1, [&](int64_t begin, int64_t end) {
-    float sc[K_BLOCK];  // per-task fp32 scratch for bf16 output path
-    for (int64_t idx = begin; idx < end; ++idx) {
-      const int64_t t = idx / n_d_blocks;
-      const int64_t db = idx % n_d_blocks;
-      const int64_t k0 = db * K_BLOCK;
-      const int64_t len = std::min(K_BLOCK, d - k0);
-
-      const float* pre = pre_buf.data() + t * HC;
-      const scalar_t* x_t = x + t * hc_d;
-      scalar_t* y_t = y + t * d;
-
-      // bf16: accumulate into fp32 scratch, then convert to output.
-      std::memset(sc, 0, len * sizeof(float));
-      for (int h = 0; h < HC; ++h) {
-        const fVec pv(pre[h]);
-        const scalar_t* xh = x_t + (int64_t)h * d + k0;
-        int64_t k = 0;
-        for (; k <= len - kVecSize; k += kVecSize) {
-          fVec xf0, xf1;
-          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(xh + k));
-          (fVec::loadu(sc + k) + pv * xf0).store(sc + k);
-          (fVec::loadu(sc + k + kFVecSize) + pv * xf1).store(sc + k + kFVecSize);
-        }
-        if (k < len) {
-          const int64_t rem = len - k;
-          const int64_t rem0 = std::min(rem, kFVecSize);
-          const int64_t rem1 = rem - rem0;
-          fVec xf0, xf1;
-          std::tie(xf0, xf1) = at::vec::convert_to_float(bVec::loadu(xh + k, rem));
-          (fVec::loadu(sc + k, rem0) + pv * xf0).store(sc + k, rem0);
-          if (rem1 > 0) (fVec::loadu(sc + k + kFVecSize, rem1) + pv * xf1).store(sc + k + kFVecSize, rem1);
-        }
-      }
-      scalar_t* yt = y_t + k0;
-      int64_t kk = 0;
-      for (; kk <= len - kVecSize; kk += kVecSize) {
-        at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + kk), fVec::loadu(sc + kk + kFVecSize)).store(yt + kk);
-      }
-      if (kk < len) {
-        const int64_t rem = len - kk;
-        const int64_t rem0 = std::min(rem, kFVecSize);
-        const int64_t rem1 = rem - rem0;
-        at::vec::convert_from_float<scalar_t>(
-            fVec::loadu(sc + kk, rem0), rem1 > 0 ? fVec::loadu(sc + kk + kFVecSize, rem1) : fVec(0.f))
-            .store(yt + kk, rem);
-      }
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// hc_head_fuse_impl<scalar_t, HC>
-// Large-T fused path built on top of existing brgemm:
-//   1) per-token inv_rms on x_flat
-//   2) block GEMM raw_mixes = x_flat @ hc_fn.T via brgemm
-//   3) scale raw_mixes by inv_rms, apply sigmoid gate
-//   4) combine y = sum_h pre[h] * x[h,:]
-//
-// This removes scaled_x materialization while still reusing the existing GEMM
-// kernel instead of a handwritten dot-product loop.
-// ---------------------------------------------------------------------------
-template <typename scalar_t, int HC>
-static void hc_head_fuse_impl(
-    scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ x,
-    const float* __restrict__ hc_fn,  // [HC, HC*d] row-major (NOT transposed)
-    float hc_scale_val,
-    const float* __restrict__ hc_base,
-    int64_t T,
-    int64_t d,
-    float hc_eps,
-    float norm_eps) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t kVecSize = bVec::size();
-  constexpr int64_t kFVecSize = fVec::size();
-  const int64_t hc_d = HC * d;
-
-  // ── Parallelism: grain=1 gives T independent tasks (e.g. 128 for T=128),
-  // saturating ~40 threads with ~3 tokens/thread.  No K-split is needed
-  // because T >> #threads; K-split only helps for T < #threads (decode), and
-  // that case already falls back to the splitk path (kSmallTokenThreshold=8).
-  //
-  // N=HC=4 is below tinygemm_kernel's minimum block width (16).  Instead we
-  // fuse the RMSnorm sq-sum with the HC dot-products in ONE pass over x[t,:].
-  // k-tiled Phase 1: upcast K_BLOCK bf16→float, consumed by all HC heads.
-  // d-tiled Phase 2: accumulate K_BLOCK floats from HC heads, fused convert.
-  // Both phases run sequentially and share ONE tile buffer per thread.
-  // Scratch per thread: K_BLOCK floats = 2KB << 32KB L1.
-  constexpr int64_t K_BLOCK = 512;  // must be >= STEP_DOT (=KU_DOT*kFVecSize)
-  const int64_t num_threads = at::get_num_threads();
-  const int64_t scratch_stride = K_BLOCK;  // reused by both phases
-  auto scratch_tensor = at::empty({num_threads * scratch_stride}, at::kFloat);
-  float* const scratch_base = scratch_tensor.data_ptr<float>();
-
-  // Constants and per-thread vec accumulators are kept outside the t-loop so
-  // the arrays are allocated once per thread, not once per token.
-  constexpr int64_t KU_DOT = 8;
-  constexpr int64_t STEP_DOT = KU_DOT * kFVecSize;
-
-  at::parallel_for(0, T, 1, [&](int64_t begin, int64_t end) {
-    const int64_t tid = at::get_thread_num();
-    float* const a_tile_ptr = scratch_base + tid * scratch_stride;
-    float* const sc_ptr = a_tile_ptr;  // reused: Phase 1 & 2 are sequential
-
-    // Reusable fVec temporaries — declared once, reused across all loops.
-    fVec v0, v1;
-    fVec sq_u[KU_DOT];
-    fVec sq_acc;
-    fVec dot_acc[HC];
-    fVec dot_u[KU_DOT];
-    fVec pre_fvec;
-
-    for (int64_t t = begin; t < end; ++t) {
-      const scalar_t* x_t = x + t * hc_d;
-      scalar_t* y_t = y + t * d;
-
-      // ── k-tiled: upcast + sq+dot fused per tile ────────────────────────
-      // Each tile upcasts K_BLOCK bf16→float into a_tile_ptr (2KB), then
-      // all HC heads consume that same 2KB before advancing k.  No separate
-      // full-width a_buf write needed; scratch is K_BLOCK+d instead of hc_d+d.
-#pragma GCC unroll 4
-      for (int h = 0; h < HC; ++h)
-        dot_acc[h] = fVec(0.f);
-      sq_acc = fVec(0.f);
-
-      for (int64_t k0 = 0; k0 < hc_d; k0 += K_BLOCK) {
-        const int64_t len = std::min(K_BLOCK, hc_d - k0);
-        const scalar_t* x_k0 = x_t + k0;
-
-        // Step 1 (tile): upcast bf16 → float into a_tile_ptr
-        {
-          int64_t k = 0;
-          for (; k <= len - kVecSize; k += kVecSize) {
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_k0 + k));
-            v0.store(a_tile_ptr + k);
-            v1.store(a_tile_ptr + k + kFVecSize);
-          }
-          if (k < len) {
-            const int64_t rem = len - k;
-            const int64_t rem0 = std::min(rem, kFVecSize);
-            const int64_t rem1 = rem - rem0;
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_k0 + k, rem));
-            v0.store(a_tile_ptr + k, rem0);
-            if (rem1 > 0) v1.store(a_tile_ptr + k + kFVecSize, rem1);
-          }
-        }
-        const float* a_tile = a_tile_ptr;
-
-        // h=0: sq and dot fused for this tile ─────────────────────────────
-        {
-          const float* w0 = hc_fn + k0;
-#pragma GCC unroll 8
-          for (int u = 0; u < KU_DOT; ++u) {
-            dot_u[u] = fVec(0.f);
-            sq_u[u] = fVec(0.f);
-          }
-          int64_t kk = 0;
-          for (; kk <= len - STEP_DOT; kk += STEP_DOT) {
-#pragma GCC unroll 8
-            for (int u = 0; u < KU_DOT; ++u) {
-              v0 = fVec::loadu(a_tile + kk + u * kFVecSize);
-              dot_u[u] += v0 * fVec::loadu(w0 + kk + u * kFVecSize);
-              sq_u[u] += v0 * v0;
-            }
-          }
-          fVec dacc = ((dot_u[0] + dot_u[1]) + (dot_u[2] + dot_u[3])) + ((dot_u[4] + dot_u[5]) + (dot_u[6] + dot_u[7]));
-          sq_acc += ((sq_u[0] + sq_u[1]) + (sq_u[2] + sq_u[3])) + ((sq_u[4] + sq_u[5]) + (sq_u[6] + sq_u[7]));
-          // dot+sq tile-tail together
-          for (; kk <= len - 2 * kFVecSize; kk += 2 * kFVecSize) {
-            v0 = fVec::loadu(a_tile + kk);
-            v1 = fVec::loadu(a_tile + kk + kFVecSize);
-            dacc += v0 * fVec::loadu(w0 + kk) + v1 * fVec::loadu(w0 + kk + kFVecSize);
-            sq_acc += v0 * v0 + v1 * v1;
-          }
-          for (; kk <= len - kFVecSize; kk += kFVecSize) {
-            v0 = fVec::loadu(a_tile + kk);
-            dacc += v0 * fVec::loadu(w0 + kk);
-            sq_acc += v0 * v0;
-          }
-          if (kk < len) {
-            v0 = fVec::loadu(a_tile + kk, len - kk);
-            dacc += v0 * fVec::loadu(w0 + kk, len - kk);
-            sq_acc += v0 * v0;
-          }
-          dot_acc[0] += dacc;
-        }
-
-        // h=1..HC-1: dot only for this tile ───────────────────────────────
-        for (int h = 1; h < HC; ++h) {
-          const float* w = hc_fn + h * hc_d + k0;
-#pragma GCC unroll 8
-          for (int u = 0; u < KU_DOT; ++u)
-            dot_u[u] = fVec(0.f);
-          int64_t kk = 0;
-          for (; kk <= len - STEP_DOT; kk += STEP_DOT) {
-#pragma GCC unroll 8
-            for (int u = 0; u < KU_DOT; ++u)
-              dot_u[u] += fVec::loadu(a_tile + kk + u * kFVecSize) * fVec::loadu(w + kk + u * kFVecSize);
-          }
-          fVec acc = ((dot_u[0] + dot_u[1]) + (dot_u[2] + dot_u[3])) + ((dot_u[4] + dot_u[5]) + (dot_u[6] + dot_u[7]));
-          for (; kk <= len - 2 * kFVecSize; kk += 2 * kFVecSize) {
-            v0 = fVec::loadu(a_tile + kk);
-            v1 = fVec::loadu(a_tile + kk + kFVecSize);
-            acc += v0 * fVec::loadu(w + kk) + v1 * fVec::loadu(w + kk + kFVecSize);
-          }
-          for (; kk <= len - kFVecSize; kk += kFVecSize) {
-            v0 = fVec::loadu(a_tile + kk);
-            acc += v0 * fVec::loadu(w + kk);
-          }
-          if (kk < len) {
-            v0 = fVec::loadu(a_tile + kk, len - kk);
-            acc += v0 * fVec::loadu(w + kk, len - kk);
-          }
-          dot_acc[h] += acc;
-        }
-      }  // k-tile loop
-
-      const float inv_rms = static_cast<float>(
-          1.0 /
-          std::sqrt(
-              static_cast<double>(vec_reduce_sum(sq_acc)) / static_cast<double>(hc_d) + static_cast<double>(norm_eps)));
-
-      float pre[HC];
-      for (int h = 0; h < HC; ++h) {
-        const float gate_in = vec_reduce_sum(dot_acc[h]) * inv_rms * hc_scale_val + hc_base[h];
-        pre[h] = 1.f / (1.f + std::exp(-gate_in)) + hc_eps;
-      }
-
-      // ── Step 2: d-tiled combine + fused bf16 convert ──────────────────
-      // Each K_BLOCK-tile: h=0 direct-assigns (eliminates memset), h=1..HC-1
-      // accumulates, then sc_ptr converts to bf16 y_t immediately while hot.
-      // sc_ptr reuses a_tile_ptr (sequential with Phase 1, same 2KB buffer).
-      for (int64_t j0 = 0; j0 < d; j0 += K_BLOCK) {
-        const int64_t jlen = std::min(K_BLOCK, d - j0);
-
-        // h=0: direct assign — no memset required
-        {
-          pre_fvec = fVec(pre[0]);
-          const scalar_t* x_th = x_t + j0;  // h=0 segment starts at x_t
-          int64_t kk = 0;
-          for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
-            (pre_fvec * v0).store(sc_ptr + kk);
-            (pre_fvec * v1).store(sc_ptr + kk + kFVecSize);
-          }
-          if (kk < jlen) {
-            const int64_t rem = jlen - kk;
-            const int64_t rem0 = std::min(rem, kFVecSize);
-            const int64_t rem1 = rem - rem0;
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
-            (pre_fvec * v0).store(sc_ptr + kk, rem0);
-            if (rem1 > 0) (pre_fvec * v1).store(sc_ptr + kk + kFVecSize, rem1);
-          }
-        }
-
-        // h=1..HC-1: accumulate into sc_ptr
-        for (int h = 1; h < HC; ++h) {
-          pre_fvec = fVec(pre[h]);
-          const scalar_t* x_th = x_t + (int64_t)h * d + j0;
-          int64_t kk = 0;
-          for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
-            (fVec::loadu(sc_ptr + kk) + pre_fvec * v0).store(sc_ptr + kk);
-            (fVec::loadu(sc_ptr + kk + kFVecSize) + pre_fvec * v1).store(sc_ptr + kk + kFVecSize);
-          }
-          if (kk < jlen) {
-            const int64_t rem = jlen - kk;
-            const int64_t rem0 = std::min(rem, kFVecSize);
-            const int64_t rem1 = rem - rem0;
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
-            (fVec::loadu(sc_ptr + kk, rem0) + pre_fvec * v0).store(sc_ptr + kk, rem0);
-            if (rem1 > 0)
-              (fVec::loadu(sc_ptr + kk + kFVecSize, rem1) + pre_fvec * v1).store(sc_ptr + kk + kFVecSize, rem1);
-          }
-        }
-
-        // fused convert: sc_ptr (hot in L1) → bf16 y_t[j0..j0+jlen)
-        int64_t kk = 0;
-        for (; kk <= jlen - kVecSize; kk += kVecSize) {
-          at::vec::convert_from_float<scalar_t>(fVec::loadu(sc_ptr + kk), fVec::loadu(sc_ptr + kk + kFVecSize))
-              .store(y_t + j0 + kk);
-        }
-        if (kk < jlen) {
-          const int64_t rem = jlen - kk;
-          const int64_t rem0 = std::min(rem, kFVecSize);
-          const int64_t rem1 = rem - rem0;
-          at::vec::convert_from_float<scalar_t>(
-              fVec::loadu(sc_ptr + kk, rem0), rem1 > 0 ? fVec::loadu(sc_ptr + kk + kFVecSize, rem1) : fVec(0.f))
-              .store(y_t + j0 + kk, rem);
-        }
-      }  // d-tile loop
-    }  // for t
-  });  // parallel_for
-}
-
-// ---------------------------------------------------------------------------
-// hc_head_combine_impl<scalar_t, HC>
-// Pass B for hc_head: mixes[T, HC] + x[T, HC, d] → y[T, d]
-//   pre[t,h] = sigmoid(mixes[t,h] * hc_scale + hc_base[h]) + hc_eps
-//   y[t,k]   = sum_h pre[t,h] * x[t,h,k]
-//
-// Optimizations:
-//   1. d-tiled (D_BLOCK=512 → 2KB sc buffer stays in L1).
-//   2. h=0 direct-assigns (no memset), h=1..HC-1 accumulates.
-//   3. Fused convert: sc → bf16 y_t immediately after all heads, while hot.
-//   4. Pre-allocated per-thread scratch (no per-task heap alloc).
-// ---------------------------------------------------------------------------
-template <typename scalar_t, int HC>
-static void hc_head_combine_impl(
-    scalar_t* __restrict__ y,         // [T, d]      output
-    const float* __restrict__ mixes,  // [T, HC]     float32 input
-    const scalar_t* __restrict__ x,   // [T, HC, d]  input
-    float hc_scale_val,
-    const float* __restrict__ hc_base,  // [HC]
-    int64_t T,
-    int64_t d,
-    float hc_eps) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int64_t kVecSize = bVec::size();
-  constexpr int64_t kFVecSize = fVec::size();
-  constexpr int64_t D_BLOCK = 512;  // 2KB fp32 scratch, fits L1
-
-  // Pre-allocate per-thread scratch outside parallel region
-  const int64_t num_threads = at::get_num_threads();
-  auto sc_tensor = at::empty({num_threads * D_BLOCK}, at::kFloat);
-  float* const sc_base = sc_tensor.data_ptr<float>();
-
-  at::parallel_for(0, T, 0, [&](int64_t begin, int64_t end) {
-    const int64_t tid = at::get_thread_num();
-    float* const sc = sc_base + tid * D_BLOCK;
-    fVec v0, v1, pre_fvec;
-
-    alignas(64) float pre[HC];
-    for (int64_t t = begin; t < end; ++t) {
-      const float* m = mixes + t * HC;
-      for (int h = 0; h < HC; ++h) {
-        float v = m[h] * hc_scale_val + hc_base[h];
-        pre[h] = 1.0f / (1.0f + std::exp(-v)) + hc_eps;
-      }
-
-      const scalar_t* x_t = x + t * HC * d;
-      scalar_t* y_t = y + t * d;
-
-      for (int64_t j0 = 0; j0 < d; j0 += D_BLOCK) {
-        const int64_t jlen = std::min(D_BLOCK, d - j0);
-
-        // h=0: direct assign (no memset)
-        {
-          pre_fvec = fVec(pre[0]);
-          const scalar_t* x_th = x_t + j0;
-          int64_t kk = 0;
-          for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
-            (pre_fvec * v0).store(sc + kk);
-            (pre_fvec * v1).store(sc + kk + kFVecSize);
-          }
-          if (kk < jlen) {
-            const int64_t rem = jlen - kk, rem0 = std::min(rem, kFVecSize), rem1 = rem - rem0;
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
-            (pre_fvec * v0).store(sc + kk, rem0);
-            if (rem1 > 0) (pre_fvec * v1).store(sc + kk + kFVecSize, rem1);
-          }
-        }
-
-        // h=1..HC-1: accumulate into sc
-        for (int h = 1; h < HC; ++h) {
-          pre_fvec = fVec(pre[h]);
-          const scalar_t* x_th = x_t + (int64_t)h * d + j0;
-          int64_t kk = 0;
-          for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
-            (fVec::loadu(sc + kk) + pre_fvec * v0).store(sc + kk);
-            (fVec::loadu(sc + kk + kFVecSize) + pre_fvec * v1).store(sc + kk + kFVecSize);
-          }
-          if (kk < jlen) {
-            const int64_t rem = jlen - kk, rem0 = std::min(rem, kFVecSize), rem1 = rem - rem0;
-            std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk, rem));
-            (fVec::loadu(sc + kk, rem0) + pre_fvec * v0).store(sc + kk, rem0);
-            if (rem1 > 0) (fVec::loadu(sc + kk + kFVecSize, rem1) + pre_fvec * v1).store(sc + kk + kFVecSize, rem1);
-          }
-        }
-
-        // Fused convert: sc (hot in L1) → bf16 y_t[j0..j0+jlen)
-        int64_t kk = 0;
-        for (; kk <= jlen - kVecSize; kk += kVecSize) {
-          at::vec::convert_from_float<scalar_t>(fVec::loadu(sc + kk), fVec::loadu(sc + kk + kFVecSize))
-              .store(y_t + j0 + kk);
-        }
-        if (kk < jlen) {
-          const int64_t rem = jlen - kk, rem0 = std::min(rem, kFVecSize), rem1 = rem - rem0;
-          at::vec::convert_from_float<scalar_t>(
-              fVec::loadu(sc + kk, rem0), rem1 > 0 ? fVec::loadu(sc + kk + kFVecSize, rem1) : fVec(0.f))
-              .store(y_t + j0 + kk, rem);
-        }
-      }  // d-tile
-    }  // t
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Thread-split heuristic for Phase 1 of hc_pre / hc_head fused kernels.
-//
-// Chooses nth_t (T-dim threads) and nth_k (K-dim threads) to balance:
-//   - weight L1-reuse  : kb-outer keeps weight tile hot; each weight tile
-//     serves (n_t_per_thread × T_BLOCK) tokens before eviction.
-//     AI_weight = T_per_kb × N_heads FLOPs/byte, which is already >> machine
-// Two regimes:
-//
-//  A) n_t_blocks >= nth  →  pure T-parallel (nth_t=nth, nth_k=1).
-//     Each thread owns all k-blocks for its t-blocks → zero partials overhead.
-//     Phase 2 reduce is trivial (1 owner per token). 10-16% measured win.
-//
-//  B) n_t_blocks < nth  →  square heuristic (parallel_2d style).
-//     Balances weight reuse (more tokens per weight tile in L1) against
-//     K-split overhead. Empirically validated: maximizing weight reuse
-//     per thread dominates over minimizing nth_k.
-//
-static inline std::pair<int, int> hc_phase1_split(int n_t_blocks, int n_k_blocks, int nth) {
-  // Regime A: pure T-parallel, zero partials
-  if (n_t_blocks >= nth) return {nth, 1};
-
-  // Regime B: square heuristic (same as parallel_2d)
-  // r = n_t_blocks / n_k_blocks; nth_t = ceil(sqrt(r * nth))
-  float r = static_cast<float>(n_t_blocks) / static_cast<float>(n_k_blocks);
-  int nth_t = static_cast<int>(std::ceil(std::sqrt(r * nth)));
-  int nth_k = 1;
-  for (; nth_t > 0; --nth_t) {
-    nth_k = nth / nth_t;
-    if (nth_t * nth_k == nth) break;
-  }
-  return {nth_t, nth_k};
-}
-
-// ---------------------------------------------------------------------------
 // hc_pre_fuse_impl<scalar_t, HC>
 // 2D-parallel fused path for hc_pre_fused_cpu (T > kSmallTokenThreshold).
 //
 // Fuses RMSnorm + GEMM (mix_hc=24 dot products) + sinkhorn + weighted combine
-// eliminating the ~55MB scaled_x buffer and the separate at::mm call.
 //
-// Phase 1: parallel_2d(n_t_blocks, n_k_blocks)
+// Phase 1: parallel_mhc_phase1(n_t_blocks, n_k_blocks)
 //   - upcast bf16→f32, fused sq_sum + mix_hc dot products → partials[]
 //   - weight tiles reused across all tokens in the same t-block range
-// Phase 2+3: per tb-owner thread (barrier, kb0==0 guard)
+// Phase 2+3: parallel_for(T)
 //   - reduce partials → inv_rms → mixes → sinkhorn → pre/post/comb
-//   - d-tiled weighted combine → y[]
+//   - d-tiled weighted combine → y[] with pre[] kept in registers
 //
-// K_BLOCK=2048: weight tile = mix_hc*2048*4B = 192KB fits in L2 (~1MB/core).
-// Partials: 16*14*32*25*4B ≈ 7.2MB for T=512, d=7168.
+// T/K/D block sizes are selected from cache/SIMD heuristics at runtime.
 // ---------------------------------------------------------------------------
 template <typename scalar_t, int HC>
 static void hc_pre_fuse_impl(
@@ -1287,22 +295,22 @@ static void hc_pre_fuse_impl(
   using fVec = at::vec::Vectorized<float>;
   constexpr int64_t kVecSize = bVec::size();   // 32 bf16
   constexpr int64_t kFVecSize = fVec::size();  // 16 fp32
-  constexpr int mix_hc = (2 + HC) * HC;        // 24 for HC=4
-  constexpr int64_t T_BLOCK = 32;
-  // K_BLOCK sized so weight tile (mix_hc × K_BLOCK × 4B) + x_cache (K_BLOCK × 4B)
-  // fits ~75% of L1d (48KB): (mix_hc+1) × K_BLOCK × 4 ≤ 36KB → K_BLOCK=384
-  constexpr int64_t K_BLOCK = 384;
-  constexpr int64_t D_BLOCK = 512;
-  constexpr int64_t MAX_K_VECS = K_BLOCK / kVecSize;  // 12
+  constexpr int mix_hc = (2 + HC) * HC;
+  constexpr int64_t K_BLOCK_CAP = 512;
+  constexpr int64_t MAX_K_VECS = K_BLOCK_CAP / kVecSize;
   const int64_t hc_d = HC * d;
   const float s0 = hc_scale[0], s1 = hc_scale[1], s2 = hc_scale[2];
+
+  const int64_t T_BLOCK = choose_t_block(T);
+  const int64_t K_BLOCK = choose_k_block(mix_hc, kVecSize, K_BLOCK_CAP);
+  const int64_t D_BLOCK = choose_d_block(kVecSize);
 
   const int64_t n_t_blocks = div_up(T, T_BLOCK);
   const int64_t n_k_blocks = div_up(hc_d, K_BLOCK);
 
   // Partial buffer: [n_t_blocks, n_k_blocks, T_BLOCK, 1+mix_hc]
   constexpr int64_t P_STRIDE = 1 + mix_hc;  // 25
-  auto partials_tensor = at::zeros({n_t_blocks * n_k_blocks * T_BLOCK * P_STRIDE}, at::kFloat);
+  auto partials_tensor = at::empty({n_t_blocks * n_k_blocks * T_BLOCK * P_STRIDE}, at::kFloat);
   float* const partials = partials_tensor.data_ptr<float>();
 
   // Per-thread scratch for Phase 3 d-tile accumulator
@@ -1310,138 +318,125 @@ static void hc_pre_fuse_impl(
   auto sc_tensor = at::empty({nth_sc * D_BLOCK}, at::kFloat);
   float* const sc_base = sc_tensor.data_ptr<float>();
 
-  // ── Phase 1: 2D-parallel fused sq + mix_hc dots ──────────────────────────
-  const int nth_phase1 = adjust_num_threads(static_cast<int>(n_t_blocks));
-  auto [nth_t_p1, nth_k_p1] = hc_phase1_split(static_cast<int>(n_t_blocks), static_cast<int>(n_k_blocks), nth_phase1);
-  parallel_2d_tiled(
-      static_cast<int>(n_t_blocks),
-      static_cast<int>(n_k_blocks),
-      nth_t_p1,
-      nth_k_p1,
-      [&](int64_t tb0, int64_t tb1, int64_t kb0, int64_t kb1) {
-        for (int64_t kb = kb0; kb < kb1; ++kb) {
-          const int64_t k0 = kb * K_BLOCK;
-          const int64_t klen = std::min(K_BLOCK, hc_d - k0);
+  // ── Phase 1: fused sq + mix_hc dots ──────────────────────────────────────
+  parallel_mhc_phase1(n_t_blocks, n_k_blocks, [&](int64_t tb0, int64_t tb1, int64_t kb0, int64_t kb1) {
+    for (int64_t kb = kb0; kb < kb1; ++kb) {
+      const int64_t k0 = kb * K_BLOCK;
+      const int64_t klen = std::min(K_BLOCK, hc_d - k0);
 
-          for (int64_t tb = tb0; tb < tb1; ++tb) {
-            const int64_t t0 = tb * T_BLOCK;
-            const int64_t tlen = std::min(T_BLOCK, T - t0);
-            float* p_base = partials + (tb * n_k_blocks + kb) * T_BLOCK * P_STRIDE;
+      for (int64_t tb = tb0; tb < tb1; ++tb) {
+        const int64_t t0 = tb * T_BLOCK;
+        const int64_t tlen = std::min(T_BLOCK, T - t0);
+        float* p_base = partials + (tb * n_k_blocks + kb) * T_BLOCK * P_STRIDE;
 
-            const float* w_ptr[mix_hc];
-            for (int h = 0; h < mix_hc; ++h)
-              w_ptr[h] = hc_fn + h * hc_d + k0;
+        const float* w_ptr[mix_hc];
+        for (int h = 0; h < mix_hc; ++h)
+          w_ptr[h] = hc_fn + h * hc_d + k0;
 
-            fVec x_cache_lo[MAX_K_VECS], x_cache_hi[MAX_K_VECS];
+        fVec x_cache_lo[MAX_K_VECS], x_cache_hi[MAX_K_VECS];
 
-            for (int64_t tl = 0; tl < tlen; ++tl) {
-              const scalar_t* x_t = x + (t0 + tl) * hc_d + k0;
-              float* p = p_base + tl * P_STRIDE;
+        for (int64_t tl = 0; tl < tlen; ++tl) {
+          const scalar_t* x_t = x + (t0 + tl) * hc_d + k0;
+          float* p = p_base + tl * P_STRIDE;
 
-              const int64_t n_full = klen / kVecSize;
-              const int64_t k_tail = n_full * kVecSize;
-              const int64_t rem = klen - k_tail;
-              const int64_t rem0 = std::min(rem, kFVecSize);
-              const int64_t rem1 = rem - rem0;
+          const int64_t n_full = klen / kVecSize;
+          const int64_t k_tail = n_full * kVecSize;
+          const int64_t rem = klen - k_tail;
+          const int64_t rem0 = std::min(rem, kFVecSize);
+          const int64_t rem1 = rem - rem0;
 
-              // Batch-prime next token's x (NTA: stream-once, avoids L1 pollution).
-              // 2-3 priming lines trigger L2 HW streamer for the rest;
-              // removes per-ki prefetch overhead from h=0 inner loop.
-              if (tl + 1 < tlen) {
-                const scalar_t* xn = x + (t0 + tl + 1) * hc_d + k0;
-                __builtin_prefetch(xn, 0, 0);
-                __builtin_prefetch(xn + kVecSize * 2, 0, 0);
-                if (n_full > 6) __builtin_prefetch(xn + kVecSize * 6, 0, 0);
-              }
+          // Batch-prime next token's x (NTA: stream-once, avoids L1 pollution).
+          // Two evenly-spaced lines engage the L2 HW streamer without excess.
+          if (tl + 1 < tlen) {
+            const scalar_t* xn = x + (t0 + tl + 1) * hc_d + k0;
+            __builtin_prefetch(xn, 0, 0);
+            if (klen > kVecSize * 4) __builtin_prefetch(xn + kVecSize * 4, 0, 0);
+          }
 
-              // h=0: convert x once, cache, fuse sq + dot[0]
-              {
-                const float* w0 = w_ptr[0];
-                fVec sq_lo(0.f), sq_hi(0.f);
-                fVec d0(0.f), d1(0.f);
-                for (int64_t ki = 0; ki < n_full; ++ki) {
-                  const int64_t k = ki * kVecSize;
-                  // tl==0: weight cold from DRAM → cascade-prefetch w[1],w[2]
-                  // tl>0:  weight warm in L1 from prior token → skip
-                  if (tl == 0) {
-                    __builtin_prefetch(w_ptr[1] + k, 0, 3);
-                    __builtin_prefetch(w_ptr[2] + k, 0, 3);
-                  }
-                  std::tie(x_cache_lo[ki], x_cache_hi[ki]) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-                  sq_lo += x_cache_lo[ki] * x_cache_lo[ki];
-                  sq_hi += x_cache_hi[ki] * x_cache_hi[ki];
-                  d0 += x_cache_lo[ki] * fVec::loadu(w0 + k);
-                  d1 += x_cache_hi[ki] * fVec::loadu(w0 + k + kFVecSize);
-                }
-
-                fVec x_tail_lo(0.f), x_tail_hi(0.f);
-                if (rem > 0) {
-                  std::tie(x_tail_lo, x_tail_hi) = at::vec::convert_to_float(bVec::loadu(x_t + k_tail, rem));
-                  sq_lo += x_tail_lo * x_tail_lo;
-                  if (rem1 > 0) sq_hi += x_tail_hi * x_tail_hi;
-                  d0 += x_tail_lo * fVec::loadu(w0 + k_tail, rem0);
-                  if (rem1 > 0) d1 += x_tail_hi * fVec::loadu(w0 + k_tail + kFVecSize, rem1);
-                }
-
-                p[0] = vec_reduce_sum(sq_lo + sq_hi);
-                p[1 + 0] = vec_reduce_sum(d0 + d1);
-
-                // h=1..mix_hc-1: reuse cached x, 2-head interleaving for 4 FMA chains
-                int h = 1;
-                for (; h + 1 < mix_hc; h += 2) {
-                  const float* wa = w_ptr[h];
-                  const float* wb = w_ptr[h + 1];
-                  fVec a0(0.f), a1(0.f), b0(0.f), b1(0.f);
-                  for (int64_t ki = 0; ki < n_full; ++ki) {
-                    const int64_t k = ki * kVecSize;
-                    // tl==0: cascade-prefetch next pair's weight from DRAM
-                    if (tl == 0) {
-                      if (h + 2 < mix_hc) __builtin_prefetch(w_ptr[h + 2] + k, 0, 3);
-                      if (h + 3 < mix_hc) __builtin_prefetch(w_ptr[h + 3] + k, 0, 3);
-                    }
-                    a0 += x_cache_lo[ki] * fVec::loadu(wa + k);
-                    b0 += x_cache_lo[ki] * fVec::loadu(wb + k);
-                    a1 += x_cache_hi[ki] * fVec::loadu(wa + k + kFVecSize);
-                    b1 += x_cache_hi[ki] * fVec::loadu(wb + k + kFVecSize);
-                  }
-                  if (rem > 0) {
-                    a0 += x_tail_lo * fVec::loadu(wa + k_tail, rem0);
-                    b0 += x_tail_lo * fVec::loadu(wb + k_tail, rem0);
-                    if (rem1 > 0) {
-                      a1 += x_tail_hi * fVec::loadu(wa + k_tail + kFVecSize, rem1);
-                      b1 += x_tail_hi * fVec::loadu(wb + k_tail + kFVecSize, rem1);
-                    }
-                  }
-                  p[1 + h] = vec_reduce_sum(a0 + a1);
-                  p[1 + h + 1] = vec_reduce_sum(b0 + b1);
-                }
-                // odd leftover (mix_hc=24 is even, so this is just for safety)
-                if (h < mix_hc) {
-                  const float* w = w_ptr[h];
-                  fVec hd0(0.f), hd1(0.f);
-                  for (int64_t ki = 0; ki < n_full; ++ki) {
-                    const int64_t k = ki * kVecSize;
-                    hd0 += x_cache_lo[ki] * fVec::loadu(w + k);
-                    hd1 += x_cache_hi[ki] * fVec::loadu(w + k + kFVecSize);
-                  }
-                  if (rem > 0) {
-                    hd0 += x_tail_lo * fVec::loadu(w + k_tail, rem0);
-                    if (rem1 > 0) hd1 += x_tail_hi * fVec::loadu(w + k_tail + kFVecSize, rem1);
-                  }
-                  p[1 + h] = vec_reduce_sum(hd0 + hd1);
-                }
-              }
-            }  // tl
-
-            // Cold-start: prime next tb's first token's x for L2 streamer
-            if (tb + 1 < tb1) {
-              const scalar_t* x_next_tb = x + ((tb + 1) * T_BLOCK) * hc_d + k0;
-              __builtin_prefetch(x_next_tb, 0, 0);
-              __builtin_prefetch(x_next_tb + kVecSize * 2, 0, 0);
+          // h=0: convert x once, cache, fuse sq + dot[0]
+          // Bulk-prime all cold weight rows before the ki loop on tl==0 so the
+          // prefetch distance is large enough to cover the entire weight tile;
+          // the HW streamer handles subsequent sequential weight access.
+          if (tl == 0) {
+            for (int pw = 1; pw < mix_hc; ++pw)
+              __builtin_prefetch(w_ptr[pw], 0, 3);
+          }
+          {
+            const float* w0 = w_ptr[0];
+            fVec sq_lo(0.f), sq_hi(0.f);
+            fVec d0(0.f), d1(0.f);
+            for (int64_t ki = 0; ki < n_full; ++ki) {
+              const int64_t k = ki * kVecSize;
+              std::tie(x_cache_lo[ki], x_cache_hi[ki]) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+              sq_lo += x_cache_lo[ki] * x_cache_lo[ki];
+              sq_hi += x_cache_hi[ki] * x_cache_hi[ki];
+              d0 += x_cache_lo[ki] * fVec::loadu(w0 + k);
+              d1 += x_cache_hi[ki] * fVec::loadu(w0 + k + kFVecSize);
             }
-          }  // tb
-        }  // kb
-      });  // Phase 1
+
+            fVec x_tail_lo(0.f), x_tail_hi(0.f);
+            if (rem > 0) {
+              std::tie(x_tail_lo, x_tail_hi) = at::vec::convert_to_float(bVec::loadu(x_t + k_tail, rem));
+              sq_lo += x_tail_lo * x_tail_lo;
+              if (rem1 > 0) sq_hi += x_tail_hi * x_tail_hi;
+              d0 += x_tail_lo * fVec::loadu(w0 + k_tail, rem0);
+              if (rem1 > 0) d1 += x_tail_hi * fVec::loadu(w0 + k_tail + kFVecSize, rem1);
+            }
+
+            p[0] = vec_reduce_sum(sq_lo + sq_hi);
+            p[1 + 0] = vec_reduce_sum(d0 + d1);
+
+            // h=1..mix_hc-1: reuse cached x, 2-head interleaving for 4 FMA chains
+            int h = 1;
+            for (; h + 1 < mix_hc; h += 2) {
+              const float* wa = w_ptr[h];
+              const float* wb = w_ptr[h + 1];
+              fVec a0(0.f), a1(0.f), b0(0.f), b1(0.f);
+              for (int64_t ki = 0; ki < n_full; ++ki) {
+                const int64_t k = ki * kVecSize;
+                a0 += x_cache_lo[ki] * fVec::loadu(wa + k);
+                b0 += x_cache_lo[ki] * fVec::loadu(wb + k);
+                a1 += x_cache_hi[ki] * fVec::loadu(wa + k + kFVecSize);
+                b1 += x_cache_hi[ki] * fVec::loadu(wb + k + kFVecSize);
+              }
+              if (rem > 0) {
+                a0 += x_tail_lo * fVec::loadu(wa + k_tail, rem0);
+                b0 += x_tail_lo * fVec::loadu(wb + k_tail, rem0);
+                if (rem1 > 0) {
+                  a1 += x_tail_hi * fVec::loadu(wa + k_tail + kFVecSize, rem1);
+                  b1 += x_tail_hi * fVec::loadu(wb + k_tail + kFVecSize, rem1);
+                }
+              }
+              p[1 + h] = vec_reduce_sum(a0 + a1);
+              p[1 + h + 1] = vec_reduce_sum(b0 + b1);
+            }
+            // odd leftover (mix_hc=24 is even, so this is just for safety)
+            if (h < mix_hc) {
+              const float* w = w_ptr[h];
+              fVec hd0(0.f), hd1(0.f);
+              for (int64_t ki = 0; ki < n_full; ++ki) {
+                const int64_t k = ki * kVecSize;
+                hd0 += x_cache_lo[ki] * fVec::loadu(w + k);
+                hd1 += x_cache_hi[ki] * fVec::loadu(w + k + kFVecSize);
+              }
+              if (rem > 0) {
+                hd0 += x_tail_lo * fVec::loadu(w + k_tail, rem0);
+                if (rem1 > 0) hd1 += x_tail_hi * fVec::loadu(w + k_tail + kFVecSize, rem1);
+              }
+              p[1 + h] = vec_reduce_sum(hd0 + hd1);
+            }
+          }
+        }  // tl
+
+        // Cold-start: prime next tb's first token's x for L2 streamer
+        if (tb + 1 < tb1) {
+          const scalar_t* x_next_tb = x + ((tb + 1) * T_BLOCK) * hc_d + k0;
+          __builtin_prefetch(x_next_tb, 0, 0);
+          if (klen > kVecSize * 4) __builtin_prefetch(x_next_tb + kVecSize * 4, 0, 0);
+        }
+      }  // tb
+    }  // kb
+  });  // Phase 1
 
   // ── Phase 2+3: reduce → sinkhorn → combine → y[] ─────────────────────────
   // Per-token independent: reduce partials, compute mixes/sinkhorn/pre/post/comb,
@@ -1455,8 +450,12 @@ static void hc_pre_fuse_impl(
       const int64_t tb = t / T_BLOCK;
       const int64_t tl = t % T_BLOCK;
 
-      // Phase 2: reduce partials → mixes → sinkhorn (vectorized)
-      constexpr int64_t dots_tail = mix_hc - kFVecSize;  // 24 - 16 = 8
+      // Phase 2: reduce partials → mixes → sinkhorn (vectorized over mix_hc).
+      // Requires kFVecSize < mix_hc <= 2*kFVecSize (satisfied for HC=4: mix_hc=24, kFVecSize=16).
+      static_assert(
+          mix_hc > kFVecSize && mix_hc <= 2 * kFVecSize,
+          "hc_pre_fuse_impl: vectorized reduce requires kFVecSize < mix_hc <= 2*kFVecSize");
+      constexpr int64_t dots_tail = mix_hc - kFVecSize;
       fVec acc_lo(0.f), acc_hi(0.f);
       double sq_total = 0.0;
       for (int64_t kb = 0; kb < n_k_blocks; ++kb) {
@@ -1487,12 +486,13 @@ static void hc_pre_fuse_impl(
         const int64_t jlen = std::min(D_BLOCK, d - j0);
 
         // h=0: direct assign
+        // HC=4 heads × D_BLOCK elems fit comfortably in L1; the HW streamer
+        // handles the sequential next-head read pattern automatically.
         {
           pre_fvec = fVec(pre_t[0]);
           const scalar_t* x_th = x_t + j0;
           int64_t kk = 0;
           for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            __builtin_prefetch(x_t + d + j0 + kk, 0, 3);
             std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
             (pre_fvec * v0).store(sc + kk);
             (pre_fvec * v1).store(sc + kk + kFVecSize);
@@ -1506,16 +506,11 @@ static void hc_pre_fuse_impl(
         }
 
         // h=1..HC-1: accumulate
-        const int64_t j_next = j0 + D_BLOCK;
         for (int h = 1; h < HC; ++h) {
           pre_fvec = fVec(pre_t[h]);
           const scalar_t* x_th = x_t + (int64_t)h * d + j0;
           int64_t kk = 0;
           for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            if (h + 1 < HC)
-              __builtin_prefetch(x_t + (int64_t)(h + 1) * d + j0 + kk, 0, 3);
-            else if (j_next < d)
-              __builtin_prefetch(x_t + j_next + kk, 0, 3);
             std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
             (fVec::loadu(sc + kk) + pre_fvec * v0).store(sc + kk);
             (fVec::loadu(sc + kk + kFVecSize) + pre_fvec * v1).store(sc + kk + kFVecSize);
@@ -1548,23 +543,21 @@ static void hc_pre_fuse_impl(
 }
 
 // ---------------------------------------------------------------------------
-// hc_head_fuse_2d_impl<scalar_t, HC>
+// hc_head_fuse_impl<scalar_t, HC>
 // 2D-parallel fused path for T ≥ kSmallTokenThreshold.
 //
 // Borrows the CUDA TileLang strategy (mhc_pre_gemm_sqrsum_splitk):
-//   parallel_2d(n_t_blocks, n_k_blocks) with loop_2d cache-friendly ordering
-//   so that hc_fn weight tiles stay in L2 while many token-blocks reuse them.
+//   adaptive Phase 1 chooses pure token-block parallelism for large prefill,
+//   or 2D T×K splitting for decode/small T to expose enough work.
 //
-// Three phases (two parallel regions + one small parallel_for):
-//   Phase 1 – parallel_2d: upcast bf16→f32 + fused sq + HC dot-products
+// Two parallel regions:
+//   Phase 1 – parallel_mhc_phase1: upcast bf16→f32 + fused sq + HC dot-products
 //             → partial_sq[tb,kb,tl] and partial_dot[tb,kb,tl,h]
-//   Phase 2 – parallel_for(T): reduce partials, compute inv_rms + sigmoid gate
-//             → pre[T, HC]
-//   Phase 3 – parallel_for(T): d-tiled weighted combine + fused bf16 convert
-//             → y[T, d]
+//   Phase 2+3 – parallel_for(T): reduce partials, compute sigmoid gates, then
+//             d-tiled weighted combine + fused bf16 convert → y[T, d]
 // ---------------------------------------------------------------------------
 template <typename scalar_t, int HC>
-static void hc_head_fuse_2d_impl(
+static void hc_head_fuse_impl(
     scalar_t* __restrict__ y,
     const scalar_t* __restrict__ x,
     const float* __restrict__ hc_fn,  // [HC, HC*d] row-major
@@ -1580,11 +573,12 @@ static void hc_head_fuse_2d_impl(
   constexpr int64_t kFVecSize = fVec::size();  // 16 fp32
   const int64_t hc_d = HC * d;
 
-  constexpr int64_t T_BLOCK = 32;
-  // K_BLOCK sized so weight tile (HC × K_BLOCK × 4B) + x_cache (K_BLOCK × 4B)
-  // fits ~75% of L1d (48KB): (HC+1) × K_BLOCK × 4 ≤ 36KB → K_BLOCK=1792
-  constexpr int64_t K_BLOCK = 1792;
-  constexpr int64_t D_BLOCK = 512;
+  constexpr int64_t K_BLOCK_CAP = 2048;
+  constexpr int64_t MAX_K_VECS = K_BLOCK_CAP / kVecSize;
+
+  const int64_t T_BLOCK = choose_t_block(T);
+  const int64_t K_BLOCK = choose_k_block(HC, kVecSize, K_BLOCK_CAP);
+  const int64_t D_BLOCK = choose_d_block(kVecSize);
 
   const int64_t n_t_blocks = div_up(T, T_BLOCK);
   const int64_t n_k_blocks = div_up(hc_d, K_BLOCK);
@@ -1592,7 +586,7 @@ static void hc_head_fuse_2d_impl(
   // Partial buffer: [n_t_blocks, n_k_blocks, T_BLOCK, 1+HC]
   //   p[0] = partial sq,  p[1..HC] = partial dots
   constexpr int64_t P_STRIDE = 1 + HC;
-  auto partials_tensor = at::zeros({n_t_blocks * n_k_blocks * T_BLOCK * P_STRIDE}, at::kFloat);
+  auto partials_tensor = at::empty({n_t_blocks * n_k_blocks * T_BLOCK * P_STRIDE}, at::kFloat);
   float* const partials = partials_tensor.data_ptr<float>();
 
   // Per-thread scratch for Phase 3 d-tile accumulator.
@@ -1600,142 +594,132 @@ static void hc_head_fuse_2d_impl(
   auto sc_tensor = at::empty({nth_sc * D_BLOCK}, at::kFloat);
   float* const sc_base = sc_tensor.data_ptr<float>();
 
-  // ── Phase 1: parallel_2d(n_t_blocks, n_k_blocks) ─────────────────────────
-  // kb OUTER, tb INNER: weight tile [HC, K_BLOCK] stays in L1 for all tokens.
-  const int nth_phase1_h = adjust_num_threads(static_cast<int>(n_t_blocks));
-  auto [nth_t_p1h, nth_k_p1h] =
-      hc_phase1_split(static_cast<int>(n_t_blocks), static_cast<int>(n_k_blocks), nth_phase1_h);
-  parallel_2d_tiled(
-      static_cast<int>(n_t_blocks),
-      static_cast<int>(n_k_blocks),
-      nth_t_p1h,
-      nth_k_p1h,
-      [&](int64_t tb0, int64_t tb1, int64_t kb0, int64_t kb1) {
-        // kb OUTER: weight tile stays in L1 across all t_blocks
-        for (int64_t kb = kb0; kb < kb1; ++kb) {
-          const int64_t k0 = kb * K_BLOCK;
-          const int64_t klen = std::min(K_BLOCK, hc_d - k0);
+  // ── Phase 1: adaptive token/K parallelism ────────────────────────────────
+  // kb OUTER, tb INNER inside each task: weight tile [HC, K_BLOCK] is reused
+  // across all token blocks assigned to that worker.
+  parallel_mhc_phase1(n_t_blocks, n_k_blocks, [&](int64_t tb0, int64_t tb1, int64_t kb0, int64_t kb1) {
+    // kb OUTER: keep the heuristic-sized weight tile hot across t_blocks.
+    for (int64_t kb = kb0; kb < kb1; ++kb) {
+      const int64_t k0 = kb * K_BLOCK;
+      const int64_t klen = std::min(K_BLOCK, hc_d - k0);
 
-          // tb INNER: all tokens share L1-resident weight
-          for (int64_t tb = tb0; tb < tb1; ++tb) {
-            const int64_t t0 = tb * T_BLOCK;
-            const int64_t tlen = std::min(T_BLOCK, T - t0);
-            float* p_base = partials + (tb * n_k_blocks + kb) * T_BLOCK * P_STRIDE;
+      // tb INNER: all tokens assigned to this task share the weight tile.
+      for (int64_t tb = tb0; tb < tb1; ++tb) {
+        const int64_t t0 = tb * T_BLOCK;
+        const int64_t tlen = std::min(T_BLOCK, T - t0);
+        float* p_base = partials + (tb * n_k_blocks + kb) * T_BLOCK * P_STRIDE;
 
-            // ── Per-token fused loops: h outer, K inner ────────────────────────
-            // Weight tile [HC,K_BLOCK] stays in L1 across all tokens (kb-outer).
-            // x-vector cache eliminates redundant bf16->fp32 conversions.
-            // x_next batch-primed to L2 at tl start; w prefetch only on tl==0.
-            const float* w_ptr[HC];
-            for (int h = 0; h < HC; ++h)
-              w_ptr[h] = hc_fn + h * hc_d + k0;
+        // ── Per-token fused loops: h outer, K inner ────────────────────────
+        // Weight tile [HC,K_BLOCK] stays in L1 across all tokens (kb-outer).
+        // x-vector cache eliminates redundant bf16->fp32 conversions.
+        // x_next batch-primed to L2 at tl start; w prefetch only on tl==0.
+        const float* w_ptr[HC];
+        for (int h = 0; h < HC; ++h)
+          w_ptr[h] = hc_fn + h * hc_d + k0;
 
-            constexpr int64_t MAX_K_VECS = K_BLOCK / kVecSize;
-            fVec x_cache_lo[MAX_K_VECS], x_cache_hi[MAX_K_VECS];
+        fVec x_cache_lo[MAX_K_VECS], x_cache_hi[MAX_K_VECS];
 
-            for (int64_t tl = 0; tl < tlen; ++tl) {
-              const scalar_t* x_t = x + (t0 + tl) * hc_d + k0;
-              float* p = p_base + tl * P_STRIDE;
+        for (int64_t tl = 0; tl < tlen; ++tl) {
+          const scalar_t* x_t = x + (t0 + tl) * hc_d + k0;
+          float* p = p_base + tl * P_STRIDE;
 
-              const int64_t n_full = klen / kVecSize;
-              const int64_t k_tail = n_full * kVecSize;
-              const int64_t rem = klen - k_tail;
-              const int64_t rem0 = std::min(rem, kFVecSize);
-              const int64_t rem1 = rem - rem0;
+          const int64_t n_full = klen / kVecSize;
+          const int64_t k_tail = n_full * kVecSize;
+          const int64_t rem = klen - k_tail;
+          const int64_t rem0 = std::min(rem, kFVecSize);
+          const int64_t rem1 = rem - rem0;
 
-              // Batch-prime next token's x (NTA: stream-once).
-              if (tl + 1 < tlen) {
-                const scalar_t* xn = x + (t0 + tl + 1) * hc_d + k0;
-                __builtin_prefetch(xn, 0, 0);
-                __builtin_prefetch(xn + kVecSize * 2, 0, 0);
-                if (n_full > 6) __builtin_prefetch(xn + kVecSize * 6, 0, 0);
-              }
+          // Batch-prime next token's x (NTA: stream-once).
+          // Two evenly-spaced lines are sufficient to engage the HW streamer.
+          if (tl + 1 < tlen) {
+            const scalar_t* xn = x + (t0 + tl + 1) * hc_d + k0;
+            __builtin_prefetch(xn, 0, 0);
+            if (klen > kVecSize * 4) __builtin_prefetch(xn + kVecSize * 4, 0, 0);
+          }
 
-              // h=0: convert x once, fuse sq + dot0, and cache converted x.
-              {
-                const float* w0 = w_ptr[0];
-                fVec sq_lo(0.f), sq_hi(0.f);
-                fVec d0(0.f), d1(0.f);
-                for (int64_t ki = 0; ki < n_full; ++ki) {
-                  const int64_t k = ki * kVecSize;
-                  if (tl == 0) {
-                    __builtin_prefetch(w_ptr[1] + k, 0, 3);
-                    __builtin_prefetch(w_ptr[2] + k, 0, 3);
-                  }
-                  std::tie(x_cache_lo[ki], x_cache_hi[ki]) = at::vec::convert_to_float(bVec::loadu(x_t + k));
-                  sq_lo += x_cache_lo[ki] * x_cache_lo[ki];
-                  sq_hi += x_cache_hi[ki] * x_cache_hi[ki];
-                  d0 += x_cache_lo[ki] * fVec::loadu(w0 + k);
-                  d1 += x_cache_hi[ki] * fVec::loadu(w0 + k + kFVecSize);
-                }
-
-                fVec x_tail_lo(0.f), x_tail_hi(0.f);
-                if (rem > 0) {
-                  std::tie(x_tail_lo, x_tail_hi) = at::vec::convert_to_float(bVec::loadu(x_t + k_tail, rem));
-                  sq_lo += x_tail_lo * x_tail_lo;
-                  if (rem1 > 0) sq_hi += x_tail_hi * x_tail_hi;
-                  d0 += x_tail_lo * fVec::loadu(w0 + k_tail, rem0);
-                  if (rem1 > 0) d1 += x_tail_hi * fVec::loadu(w0 + k_tail + kFVecSize, rem1);
-                }
-
-                p[0] = vec_reduce_sum(sq_lo + sq_hi);
-                p[1 + 0] = vec_reduce_sum(d0 + d1);
-
-                // h=1..HC-1: reuse cached x, 2-head interleaving for 4 FMA chains
-                int h = 1;
-                for (; h + 1 < HC; h += 2) {
-                  const float* wa = w_ptr[h];
-                  const float* wb = w_ptr[h + 1];
-                  fVec a0(0.f), a1(0.f), b0(0.f), b1(0.f);
-                  for (int64_t ki = 0; ki < n_full; ++ki) {
-                    const int64_t k = ki * kVecSize;
-                    if (tl == 0) {
-                      if (h + 2 < HC) __builtin_prefetch(w_ptr[h + 2] + k, 0, 3);
-                      if (h + 3 < HC) __builtin_prefetch(w_ptr[h + 3] + k, 0, 3);
-                    }
-                    a0 += x_cache_lo[ki] * fVec::loadu(wa + k);
-                    b0 += x_cache_lo[ki] * fVec::loadu(wb + k);
-                    a1 += x_cache_hi[ki] * fVec::loadu(wa + k + kFVecSize);
-                    b1 += x_cache_hi[ki] * fVec::loadu(wb + k + kFVecSize);
-                  }
-                  if (rem > 0) {
-                    a0 += x_tail_lo * fVec::loadu(wa + k_tail, rem0);
-                    b0 += x_tail_lo * fVec::loadu(wb + k_tail, rem0);
-                    if (rem1 > 0) {
-                      a1 += x_tail_hi * fVec::loadu(wa + k_tail + kFVecSize, rem1);
-                      b1 += x_tail_hi * fVec::loadu(wb + k_tail + kFVecSize, rem1);
-                    }
-                  }
-                  p[1 + h] = vec_reduce_sum(a0 + a1);
-                  p[1 + h + 1] = vec_reduce_sum(b0 + b1);
-                }
-                // odd leftover (HC=4: h=3 is the leftover)
-                if (h < HC) {
-                  const float* w = w_ptr[h];
-                  fVec hd0(0.f), hd1(0.f);
-                  for (int64_t ki = 0; ki < n_full; ++ki) {
-                    const int64_t k = ki * kVecSize;
-                    hd0 += x_cache_lo[ki] * fVec::loadu(w + k);
-                    hd1 += x_cache_hi[ki] * fVec::loadu(w + k + kFVecSize);
-                  }
-                  if (rem > 0) {
-                    hd0 += x_tail_lo * fVec::loadu(w + k_tail, rem0);
-                    if (rem1 > 0) hd1 += x_tail_hi * fVec::loadu(w + k_tail + kFVecSize, rem1);
-                  }
-                  p[1 + h] = vec_reduce_sum(hd0 + hd1);
-                }
-              }
-            }  // tl
-
-            // Cold-start: prime next tb's first token's x for L2 streamer
-            if (tb + 1 < tb1) {
-              const scalar_t* x_next_tb = x + ((tb + 1) * T_BLOCK) * hc_d + k0;
-              __builtin_prefetch(x_next_tb, 0, 0);
-              __builtin_prefetch(x_next_tb + kVecSize * 2, 0, 0);
+          // h=0: convert x once, fuse sq + dot0, and cache converted x.
+          // Bulk-prime all cold weight rows before the ki loop so the prefetch
+          // distance covers the entire weight tile (HW streamer takes over after).
+          if (tl == 0) {
+            for (int pw = 1; pw < HC; ++pw)
+              __builtin_prefetch(w_ptr[pw], 0, 3);
+          }
+          {
+            const float* w0 = w_ptr[0];
+            fVec sq_lo(0.f), sq_hi(0.f);
+            fVec d0(0.f), d1(0.f);
+            for (int64_t ki = 0; ki < n_full; ++ki) {
+              const int64_t k = ki * kVecSize;
+              std::tie(x_cache_lo[ki], x_cache_hi[ki]) = at::vec::convert_to_float(bVec::loadu(x_t + k));
+              sq_lo += x_cache_lo[ki] * x_cache_lo[ki];
+              sq_hi += x_cache_hi[ki] * x_cache_hi[ki];
+              d0 += x_cache_lo[ki] * fVec::loadu(w0 + k);
+              d1 += x_cache_hi[ki] * fVec::loadu(w0 + k + kFVecSize);
             }
-          }  // tb
-        }  // kb
-      });  // Phase 1
+
+            fVec x_tail_lo(0.f), x_tail_hi(0.f);
+            if (rem > 0) {
+              std::tie(x_tail_lo, x_tail_hi) = at::vec::convert_to_float(bVec::loadu(x_t + k_tail, rem));
+              sq_lo += x_tail_lo * x_tail_lo;
+              if (rem1 > 0) sq_hi += x_tail_hi * x_tail_hi;
+              d0 += x_tail_lo * fVec::loadu(w0 + k_tail, rem0);
+              if (rem1 > 0) d1 += x_tail_hi * fVec::loadu(w0 + k_tail + kFVecSize, rem1);
+            }
+
+            p[0] = vec_reduce_sum(sq_lo + sq_hi);
+            p[1 + 0] = vec_reduce_sum(d0 + d1);
+
+            // h=1..HC-1: reuse cached x, 2-head interleaving for 4 FMA chains
+            int h = 1;
+            for (; h + 1 < HC; h += 2) {
+              const float* wa = w_ptr[h];
+              const float* wb = w_ptr[h + 1];
+              fVec a0(0.f), a1(0.f), b0(0.f), b1(0.f);
+              for (int64_t ki = 0; ki < n_full; ++ki) {
+                const int64_t k = ki * kVecSize;
+                a0 += x_cache_lo[ki] * fVec::loadu(wa + k);
+                b0 += x_cache_lo[ki] * fVec::loadu(wb + k);
+                a1 += x_cache_hi[ki] * fVec::loadu(wa + k + kFVecSize);
+                b1 += x_cache_hi[ki] * fVec::loadu(wb + k + kFVecSize);
+              }
+              if (rem > 0) {
+                a0 += x_tail_lo * fVec::loadu(wa + k_tail, rem0);
+                b0 += x_tail_lo * fVec::loadu(wb + k_tail, rem0);
+                if (rem1 > 0) {
+                  a1 += x_tail_hi * fVec::loadu(wa + k_tail + kFVecSize, rem1);
+                  b1 += x_tail_hi * fVec::loadu(wb + k_tail + kFVecSize, rem1);
+                }
+              }
+              p[1 + h] = vec_reduce_sum(a0 + a1);
+              p[1 + h + 1] = vec_reduce_sum(b0 + b1);
+            }
+            // odd leftover (HC=4: h=3 is the leftover)
+            if (h < HC) {
+              const float* w = w_ptr[h];
+              fVec hd0(0.f), hd1(0.f);
+              for (int64_t ki = 0; ki < n_full; ++ki) {
+                const int64_t k = ki * kVecSize;
+                hd0 += x_cache_lo[ki] * fVec::loadu(w + k);
+                hd1 += x_cache_hi[ki] * fVec::loadu(w + k + kFVecSize);
+              }
+              if (rem > 0) {
+                hd0 += x_tail_lo * fVec::loadu(w + k_tail, rem0);
+                if (rem1 > 0) hd1 += x_tail_hi * fVec::loadu(w + k_tail + kFVecSize, rem1);
+              }
+              p[1 + h] = vec_reduce_sum(hd0 + hd1);
+            }
+          }
+        }  // tl
+
+        // Cold-start: prime next tb's first token's x for L2 streamer
+        if (tb + 1 < tb1) {
+          const scalar_t* x_next_tb = x + ((tb + 1) * T_BLOCK) * hc_d + k0;
+          __builtin_prefetch(x_next_tb, 0, 0);
+          if (klen > kVecSize * 2) __builtin_prefetch(x_next_tb + kVecSize * 2, 0, 0);
+        }
+      }  // tb
+    }  // kb
+  });  // Phase 1
 
   // ── Phase 2+3: reduce partials + sigmoid gate + combine → y[] ─────────────
   at::parallel_for(0, T, 1, [&](int64_t begin, int64_t end) {
@@ -1769,13 +753,14 @@ static void hc_head_fuse_2d_impl(
       for (int64_t j0 = 0; j0 < d; j0 += D_BLOCK) {
         const int64_t jlen = std::min(D_BLOCK, d - j0);
 
-        // h=0: direct assign (no memset)
+        // h=0: direct assign
+        // HC=4 heads × D_BLOCK elems fit in L1; HW streamer handles sequential
+        // next-head accesses automatically without per-vector manual prefetch.
         {
           pre_fvec = fVec(pre_t[0]);
           const scalar_t* x_th = x_t + j0;
           int64_t kk = 0;
           for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            __builtin_prefetch(x_t + d + j0 + kk, 0, 3);
             std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
             (pre_fvec * v0).store(sc + kk);
             (pre_fvec * v1).store(sc + kk + kFVecSize);
@@ -1789,16 +774,11 @@ static void hc_head_fuse_2d_impl(
         }
 
         // h=1..HC-1: accumulate
-        const int64_t j_next = j0 + D_BLOCK;
         for (int h = 1; h < HC; ++h) {
           pre_fvec = fVec(pre_t[h]);
           const scalar_t* x_th = x_t + (int64_t)h * d + j0;
           int64_t kk = 0;
           for (; kk <= jlen - kVecSize; kk += kVecSize) {
-            if (h + 1 < HC)
-              __builtin_prefetch(x_t + (int64_t)(h + 1) * d + j0 + kk, 0, 3);
-            else if (j_next < d)
-              __builtin_prefetch(x_t + j_next + kk, 0, 3);
             std::tie(v0, v1) = at::vec::convert_to_float(bVec::loadu(x_th + kk));
             (fVec::loadu(sc + kk) + pre_fvec * v0).store(sc + kk);
             (fVec::loadu(sc + kk + kFVecSize) + pre_fvec * v1).store(sc + kk + kFVecSize);
@@ -1832,24 +812,20 @@ static void hc_head_fuse_2d_impl(
 
 }  // anonymous namespace
 
-// ============================================================================
-// Public interface
-// ============================================================================
-
 // ---------------------------------------------------------------------------
 // hc_pre_fused_cpu
 // Inputs:
-//   x         [T, hc_mult, d]          bf16 or float32
+//   x         [T, hc_mult, d]          bf16
 //   hc_fn     [mix_hc, hc_mult*d]      float32   (projection weight)
 //   hc_scale  [3]                      float32
 //   hc_base   [mix_hc]                 float32
-// Outputs: (y [T,d] same dtype as x,  post [T,hc_mult] float32,
+// Outputs: (y [T,d] bf16,  post [T,hc_mult] float32,
 //           comb [T,hc_mult,hc_mult]  float32)
 //
-// Algorithm:
-//   Pass A (parallel): scaled_x[T, hc_d] = x_flat * rsqrt  (RMSnorm scale)
-//   GEMM: mixes = at::mm(scaled_x, hc_fn.T)  [T, mix_hc]
-//   Pass B (parallel): sinkhorn + weighted combine
+// Algorithm (fully fused, no intermediate scaled_x):
+//   Per token: inv_rms = rsqrt(mean(x_flat^2) + rms_eps)
+//   mixes     = (x_flat @ hc_fn.T) * inv_rms   [T, mix_hc]
+//   sinkhorn + weighted combine → y, post, comb
 // ---------------------------------------------------------------------------
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
     at::Tensor& x,
@@ -1864,8 +840,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
   TORCH_CHECK(hc_mult == 4, "hc_pre_fused_cpu: only hc_mult=4 is supported");
   TORCH_CHECK(x.dim() == 3 && x.scalar_type() == at::kBFloat16, "hc_pre_fused_cpu: x must be bf16 [T, hc, d]");
   TORCH_CHECK(hc_fn.scalar_type() == at::kFloat, "hc_pre_fused_cpu: hc_fn must be float32");
-  TORCH_CHECK(hc_scale.scalar_type() == at::kFloat, "hc_pre_fused_cpu: hc_scale must be float32");
+  TORCH_CHECK(
+      hc_scale.scalar_type() == at::kFloat && hc_scale.numel() == 3, "hc_pre_fused_cpu: hc_scale must be float32 [3]");
   TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_pre_fused_cpu: hc_base must be float32");
+  TORCH_CHECK(
+      x.device().is_cpu() && hc_fn.device().is_cpu() && hc_scale.device().is_cpu() && hc_base.device().is_cpu(),
+      "hc_pre_fused_cpu: all inputs must be CPU tensors");
+
+  const int64_t T = x.size(0);
+  const int64_t d = x.size(2);
+  const int64_t hc_d = hc_mult * d;
+  const int64_t mix_hc = (2 + hc_mult) * hc_mult;
+
+  TORCH_CHECK(T > 0 && d > 0, "hc_pre_fused_cpu: T and d must be positive");
+  TORCH_CHECK(x.size(1) == hc_mult, "hc_pre_fused_cpu: x shape must be [T, hc_mult, d]");
+  TORCH_CHECK(
+      hc_fn.dim() == 2 && hc_fn.size(0) == mix_hc && hc_fn.size(1) == hc_d,
+      "hc_pre_fused_cpu: hc_fn must be [mix_hc, hc_mult*d]");
+  TORCH_CHECK(hc_base.numel() == mix_hc, "hc_pre_fused_cpu: hc_base.numel() must equal mix_hc");
 
   // Accept non-contiguous inputs and use contiguous copies/views internally.
   const at::Tensor x_c = x.is_contiguous() ? x : x.contiguous();
@@ -1873,66 +865,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
   const at::Tensor hc_scale_c = hc_scale.is_contiguous() ? hc_scale : hc_scale.contiguous();
   const at::Tensor hc_base_c = hc_base.is_contiguous() ? hc_base : hc_base.contiguous();
 
-  const int64_t T = x.size(0);
-  const int64_t d = x.size(2);
-  const int64_t hc_d = hc_mult * d;
-  const int64_t mix_hc = (2 + hc_mult) * hc_mult;
-
   auto f32_opts = at::TensorOptions().dtype(at::kFloat).device(x.device());
   auto post = at::empty({T, hc_mult}, f32_opts);
   auto comb = at::empty({T, hc_mult, hc_mult}, f32_opts);
   auto y = at::empty({T, d}, x.options());
 
-  // For T > threshold, use fully fused path: eliminates scaled_x (~55MB)
-  // allocation + separate RMSnorm pass + at::mm overhead.
-  // For T ≤ threshold, keep splitk RMSnorm + at::mm (better parallelism).
-  constexpr int64_t kSmallTokenThreshold = 0;
-  if (T > kSmallTokenThreshold) {
-    hc_pre_fuse_impl<c10::BFloat16, 4>(
-        y.data_ptr<c10::BFloat16>(),
-        post.data_ptr<float>(),
-        comb.data_ptr<float>(),
-        x_c.data_ptr<c10::BFloat16>(),
-        hc_fn_c.data_ptr<float>(),
-        hc_scale_c.data_ptr<float>(),
-        hc_base_c.data_ptr<float>(),
-        T,
-        d,
-        static_cast<int>(sinkhorn_iters),
-        static_cast<float>(hc_eps),
-        static_cast<float>(rms_eps));
-    return {y, post, comb};
-  }
-
-  // Small-T fallback: splitk RMSnorm + at::mm + combine
-  auto scaled_x = at::empty({T, hc_d}, f32_opts);
-  hc_pre_scale_splitk_impl<c10::BFloat16>(
-      scaled_x.data_ptr<float>(), x_c.data_ptr<c10::BFloat16>(), T, hc_d, static_cast<float>(rms_eps));
-
-  auto mixes = at::mm(scaled_x, hc_fn_c.t());
-  TORCH_CHECK(mixes.size(1) == mix_hc);
-
-  hc_pre_combine_impl<c10::BFloat16, 4>(
+  hc_pre_fuse_impl<c10::BFloat16, 4>(
       y.data_ptr<c10::BFloat16>(),
       post.data_ptr<float>(),
       comb.data_ptr<float>(),
-      mixes.contiguous().data_ptr<float>(),
       x_c.data_ptr<c10::BFloat16>(),
+      hc_fn_c.data_ptr<float>(),
       hc_scale_c.data_ptr<float>(),
       hc_base_c.data_ptr<float>(),
       T,
       d,
       static_cast<int>(sinkhorn_iters),
-      static_cast<float>(hc_eps));
-
+      static_cast<float>(hc_eps),
+      static_cast<float>(rms_eps));
   return {y, post, comb};
 }
 
 // ---------------------------------------------------------------------------
 // hc_post_fused_cpu
 // Inputs:
-//   x         [T, d]         bf16 or float32  (sublayer output)
-//   residual  [T, hc_mult, d] same dtype       (pre-sublayer residual)
+//   x         [T, d]         bf16  (sublayer output)
+//   residual  [T, hc_mult, d] bf16 (pre-sublayer residual)
 //   post      [T, hc_mult]   float32
 //   comb      [T, hc_mult, hc_mult]  float32
 // Output: out [T, hc_mult, d]  same dtype as x
@@ -1941,15 +899,27 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
 // ---------------------------------------------------------------------------
 at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& post, at::Tensor& comb) {
   RECORD_FUNCTION("sgl-kernel::hc_post_fused_cpu", {});
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "hc_post_fused_cpu: x must be bf16");
-  TORCH_CHECK(residual.scalar_type() == x.scalar_type(), "hc_post_fused_cpu: residual must have same dtype as x");
+  TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kBFloat16, "hc_post_fused_cpu: x must be bf16 [T, d]");
+  TORCH_CHECK(
+      residual.dim() == 3 && residual.scalar_type() == x.scalar_type(),
+      "hc_post_fused_cpu: residual must be bf16 [T, hc, d]");
   TORCH_CHECK(post.scalar_type() == at::kFloat, "hc_post_fused_cpu: post must be float32");
   TORCH_CHECK(comb.scalar_type() == at::kFloat, "hc_post_fused_cpu: comb must be float32");
+  TORCH_CHECK(
+      x.device().is_cpu() && residual.device().is_cpu() && post.device().is_cpu() && comb.device().is_cpu(),
+      "hc_post_fused_cpu: all inputs must be CPU tensors");
 
   const int64_t T = x.size(0);
   const int64_t d = x.size(1);
   const int64_t hc = residual.size(1);
   TORCH_CHECK(hc == 4, "hc_post_fused_cpu: only hc_mult=4 is supported");
+  TORCH_CHECK(T > 0 && d > 0, "hc_post_fused_cpu: T and d must be positive");
+  TORCH_CHECK(residual.size(0) == T && residual.size(2) == d, "hc_post_fused_cpu: residual shape must be [T, hc, d]");
+  TORCH_CHECK(
+      post.dim() == 2 && post.size(0) == T && post.size(1) == hc, "hc_post_fused_cpu: post shape must be [T, hc]");
+  TORCH_CHECK(
+      comb.dim() == 3 && comb.size(0) == T && comb.size(1) == hc && comb.size(2) == hc,
+      "hc_post_fused_cpu: comb shape must be [T, hc, hc]");
 
   // Accept non-contiguous inputs and use contiguous copies/views internally.
   const at::Tensor x_c = x.is_contiguous() ? x : x.contiguous();
@@ -1959,30 +929,14 @@ at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& po
 
   auto out = at::empty({T, hc, d}, x.options());  // same dtype as x
 
-  // Small T*HC: use K-split path to expose T*HC*K_SPLITS parallel tasks.
-  // Large T*HC: the existing T*HC parallelism is sufficient.
-  constexpr int64_t kSmallTaskThreshold = 8;
-  const bool use_splitk = (T * hc <= kSmallTaskThreshold);
-
-  TORCH_CHECK(x_c.scalar_type() == at::kBFloat16, "hc_post_fused_cpu: x must be bf16");
-  if (use_splitk)
-    hc_post_splitk_impl<c10::BFloat16, 4>(
-        out.data_ptr<c10::BFloat16>(),
-        x_c.data_ptr<c10::BFloat16>(),
-        residual_c.data_ptr<c10::BFloat16>(),
-        post_c.data_ptr<float>(),
-        comb_c.data_ptr<float>(),
-        T,
-        d);
-  else
-    hc_post_impl<c10::BFloat16, 4>(
-        out.data_ptr<c10::BFloat16>(),
-        x_c.data_ptr<c10::BFloat16>(),
-        residual_c.data_ptr<c10::BFloat16>(),
-        post_c.data_ptr<float>(),
-        comb_c.data_ptr<float>(),
-        T,
-        d);
+  hc_post_fuse_impl<c10::BFloat16, 4>(
+      out.data_ptr<c10::BFloat16>(),
+      x_c.data_ptr<c10::BFloat16>(),
+      residual_c.data_ptr<c10::BFloat16>(),
+      post_c.data_ptr<float>(),
+      comb_c.data_ptr<float>(),
+      T,
+      d);
 
   return out;
 }
@@ -1990,185 +944,60 @@ at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& po
 // ---------------------------------------------------------------------------
 // hc_head_fused_cpu
 // Inputs:
-//   x         [T, hc_mult, d]     bf16 or float32
-//   hc_fn     [hc_mult, hc_mult*d] float32  (projection weight)
-//   hc_scale  scalar or [1]       float32
-//   hc_base   [hc_mult]           float32
-// Output: y [T, d]  same dtype as x
+//   x         [T, hc_mult, d]       bf16
+//   hc_fn     [hc_mult, hc_mult*d]  float32  (projection weight)
+//   hc_scale  scalar [1]            float32
+//   hc_base   [hc_mult]             float32
+// Output: y [T, d]  bf16
 //
-// Algorithm:
-//   Pass A: scaled_x [T, hc_d] = x_flat * rsqrt(mean(x_flat^2)+norm_eps)
-//   GEMM:   mixes    [T, hc_mult] = scaled_x @ hc_fn.T
-//   Pass B: pre = sigmoid(mixes * hc_scale + hc_base) + hc_eps
-//           y  = sum_h pre[:,h] * x[:,h,:]   (SIMD over d)
+// Algorithm (fully fused, no intermediate scaled_x):
+//   Per token: inv_rms = rsqrt(mean(x_flat^2) + norm_eps)
+//   mixes[h] = dot(x_flat, hc_fn[h,:]) * inv_rms
+//   pre[h]   = sigmoid(mixes[h] * hc_scale + hc_base[h]) + hc_eps
+//   y        = sum_h pre[h] * x[h,:]  (SIMD over d)
 // ---------------------------------------------------------------------------
 at::Tensor hc_head_fused_cpu(
     at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps) {
   RECORD_FUNCTION("sgl-kernel::hc_head_fused_cpu", {});
+  TORCH_CHECK(x.dim() == 3 && x.scalar_type() == at::kBFloat16, "hc_head_fused_cpu: x must be bf16 [T, hc, d]");
   const int64_t hc_mult = x.size(1);
   TORCH_CHECK(hc_mult == 4, "hc_head_fused_cpu: only hc_mult=4 is supported");
+  TORCH_CHECK(hc_fn.scalar_type() == at::kFloat, "hc_head_fused_cpu: hc_fn must be float32");
   TORCH_CHECK(
-      x.dim() == 3 && x.is_contiguous() && x.scalar_type() == at::kBFloat16,
-      "hc_head_fused_cpu: x must be contiguous bf16 [T, hc, d]");
-  TORCH_CHECK(hc_fn.is_contiguous() && hc_fn.scalar_type() == at::kFloat);
-  TORCH_CHECK(hc_base.is_contiguous() && hc_base.scalar_type() == at::kFloat);
-  TORCH_CHECK(hc_base.numel() == hc_mult);
-  TORCH_CHECK(hc_scale.scalar_type() == at::kFloat);
+      hc_scale.scalar_type() == at::kFloat && hc_scale.numel() == 1,
+      "hc_head_fused_cpu: hc_scale must be a scalar float32");
+  TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_head_fused_cpu: hc_base must be float32");
+  TORCH_CHECK(hc_base.numel() == hc_mult, "hc_head_fused_cpu: hc_base.numel() must equal hc_mult");
+  TORCH_CHECK(
+      x.device().is_cpu() && hc_fn.device().is_cpu() && hc_scale.device().is_cpu() && hc_base.device().is_cpu(),
+      "hc_head_fused_cpu: all inputs must be CPU tensors");
 
-  const float hc_scale_val = hc_scale.item<float>();
   const int64_t T = x.size(0);
   const int64_t d = x.size(2);
-  const int64_t hc_d = hc_mult * d;
+  TORCH_CHECK(T > 0 && d > 0, "hc_head_fused_cpu: T and d must be positive");
+  TORCH_CHECK(
+      hc_fn.dim() == 2 && hc_fn.size(0) == hc_mult && hc_fn.size(1) == hc_mult * d,
+      "hc_head_fused_cpu: hc_fn must be [hc_mult, hc_mult*d]");
+
+  // Accept non-contiguous inputs; make contiguous copies if needed.
+  const at::Tensor x_c = x.is_contiguous() ? x : x.contiguous();
+  const at::Tensor hc_fn_c = hc_fn.is_contiguous() ? hc_fn : hc_fn.contiguous();
+  const at::Tensor hc_scale_c = hc_scale.is_contiguous() ? hc_scale : hc_scale.contiguous();
+  const at::Tensor hc_base_c = hc_base.is_contiguous() ? hc_base : hc_base.contiguous();
+  const float hc_scale_val = hc_scale_c.data_ptr<float>()[0];
 
   auto y = at::empty({T, d}, x.options());
 
-  // Small-T: fully fused split-K path (no intermediate tensors).
-  // Large-T: RMSnorm → at::mm (MKL SGEMM with optimal weight reuse) → combine.
-  constexpr int64_t kSmallTokenThreshold = 32;
-
-  if (T < kSmallTokenThreshold) {
-    hc_head_splitk_fuse_impl<c10::BFloat16, 4>(
-        y.data_ptr<c10::BFloat16>(),
-        x.data_ptr<c10::BFloat16>(),
-        hc_fn.data_ptr<float>(),
-        hc_scale_val,
-        hc_base.data_ptr<float>(),
-        T,
-        d,
-        static_cast<float>(hc_eps),
-        static_cast<float>(norm_eps));
-  } else {
-    hc_head_fuse_2d_impl<c10::BFloat16, 4>(
-        y.data_ptr<c10::BFloat16>(),
-        x.data_ptr<c10::BFloat16>(),
-        hc_fn.data_ptr<float>(),
-        hc_scale_val,
-        hc_base.data_ptr<float>(),
-        T,
-        d,
-        static_cast<float>(hc_eps),
-        static_cast<float>(norm_eps));
-  }
+  hc_head_fuse_impl<c10::BFloat16, 4>(
+      y.data_ptr<c10::BFloat16>(),
+      x_c.data_ptr<c10::BFloat16>(),
+      hc_fn_c.data_ptr<float>(),
+      hc_scale_val,
+      hc_base_c.data_ptr<float>(),
+      T,
+      d,
+      static_cast<float>(hc_eps),
+      static_cast<float>(norm_eps));
 
   return y;
 }
-
-/*
-mm
-
-  hc_head (T=   1, D=4096, bf16)           | C++   0.103ms | PyTorch   0.135ms | Compile   0.147ms | Speedup  1.31x |
-Throughput (C++/PyTorch): 159426.8/121543.3 elem/ms hc_head (T=   2, D=4096, bf16)           | C++   0.097ms | PyTorch
-0.191ms | Compile   0.204ms | Speedup  1.97x | Throughput (C++/PyTorch): 337878.3/171405.7 elem/ms hc_head (T=   4,
-D=4096, bf16)           | C++   0.117ms | PyTorch   0.312ms | Compile   0.209ms | Speedup  2.66x | Throughput
-(C++/PyTorch): 558047.4/210114.0 elem/ms hc_head (T=   8, D=4096, bf16)           | C++   0.120ms | PyTorch   0.325ms |
-Compile   0.324ms | Speedup  2.71x | Throughput (C++/PyTorch): 1090776.0/402905.1 elem/ms hc_head (T=  16, D=4096, bf16)
-| C++   0.112ms | PyTorch   0.397ms | Compile   0.332ms | Speedup  3.54x | Throughput (C++/PyTorch): 2339205.6/660430.1
-elem/ms hc_head (T=  32, D=4096, bf16)           | C++   0.209ms | PyTorch   0.386ms | Compile   0.420ms |
-Speedup  1.85x | Throughput (C++/PyTorch): 2506464.4/1357131.5 elem/ms hc_head (T=  64, D=4096, bf16)           | C++
-0.209ms | PyTorch   0.520ms | Compile   0.511ms | Speedup  2.49x | Throughput (C++/PyTorch): 5015335.6/2015883.3 elem/ms
-  hc_head (T= 128, D=4096, bf16)           | C++   0.291ms | PyTorch   0.812ms | Compile   0.920ms | Speedup  2.79x |
-Throughput (C++/PyTorch): 7217137.8/2583019.4 elem/ms hc_head (T= 256, D=4096, bf16)           | C++   0.537ms | PyTorch
-1.049ms | Compile   1.722ms | Speedup  1.95x | Throughput (C++/PyTorch): 7812850.7/3998973.9 elem/ms hc_head (T= 512,
-D=4096, bf16)           | C++   0.512ms | PyTorch   1.142ms | Compile   3.539ms | Speedup  2.23x | Throughput
-(C++/PyTorch): 16397726.9/7343948.8 elem/ms hc_head (T=1024, D=4096, bf16)           | C++   1.147ms | PyTorch   2.653ms
-| Compile   6.449ms | Speedup  2.31x | Throughput (C++/PyTorch): 14630667.5/6324271.8 elem/ms hc_head (T=2048, D=4096,
-bf16)           | C++   2.437ms | PyTorch   5.934ms | Compile  13.550ms | Speedup  2.44x | Throughput (C++/PyTorch):
-13770900.9/5654958.5 elem/ms hc_head (T=   1, D=7168, bf16)           | C++   0.106ms | PyTorch   0.208ms | Compile
-0.170ms | Speedup  1.95x | Throughput (C++/PyTorch): 269530.6/137888.3 elem/ms hc_head (T=   2, D=7168, bf16) | C++
-0.106ms | PyTorch   0.303ms | Compile   0.257ms | Speedup  2.87x | Throughput (C++/PyTorch): 542996.8/189145.7 elem/ms
-  hc_head (T=   4, D=7168, bf16)           | C++   0.121ms | PyTorch   0.308ms | Compile   0.326ms | Speedup  2.54x |
-Throughput (C++/PyTorch): 944794.0/372340.2 elem/ms hc_head (T=   8, D=7168, bf16)           | C++   0.099ms | PyTorch
-0.337ms | Compile   0.422ms | Speedup  3.42x | Throughput (C++/PyTorch): 2322276.0/679674.0 elem/ms hc_head (T=  16,
-D=7168, bf16)           | C++   0.103ms | PyTorch   0.349ms | Compile   0.370ms | Speedup  3.38x | Throughput
-(C++/PyTorch): 4444724.9/1315466.9 elem/ms hc_head (T=  32, D=7168, bf16)           | C++   0.315ms | PyTorch   0.322ms
-| Compile   0.503ms | Speedup  1.02x | Throughput (C++/PyTorch): 2916266.2/2845963.3 elem/ms hc_head (T=  64, D=7168,
-bf16)           | C++   0.362ms | PyTorch   0.690ms | Compile   0.785ms | Speedup  1.91x | Throughput (C++/PyTorch):
-5074414.3/2657882.0 elem/ms hc_head (T= 128, D=7168, bf16)           | C++   0.768ms | PyTorch   0.794ms |
-Compile   1.464ms | Speedup  1.03x | Throughput (C++/PyTorch): 4780563.3/4622045.3 elem/ms hc_head (T= 256, D=7168,
-bf16)           | C++   0.894ms | PyTorch   1.169ms | Compile   3.554ms | Speedup  1.31x | Throughput (C++/PyTorch):
-8209548.6/6277644.4 elem/ms hc_head (T= 512, D=7168, bf16)           | C++   1.046ms | PyTorch   2.698ms |
-Compile   5.784ms | Speedup  2.58x | Throughput (C++/PyTorch): 14034122.5/5440914.3 elem/ms hc_head (T=1024, D=7168,
-bf16)           | C++   2.152ms | PyTorch   4.561ms | Compile  10.009ms | Speedup  2.12x | Throughput (C++/PyTorch):
-13643980.5/6437388.8 elem/ms hc_head (T=2048, D=7168, bf16)           | C++   5.021ms | PyTorch  14.409ms |
-Compile  19.840ms | Speedup  2.87x | Throughput (C++/PyTorch): 11693883.7/4075322.7 elem/ms
-
-
-
-
-  ====================================================
-
-
-
-  hc_head (T=   1, D=4096, bf16)           | C++   0.102ms | PyTorch   0.133ms | Compile   0.149ms | Speedup  1.30x |
-Throughput (C++/PyTorch): 159905.5/123023.2 elem/ms hc_head (T=   2, D=4096, bf16)           | C++   0.095ms | PyTorch
-0.188ms | Compile   0.201ms | Speedup  1.98x | Throughput (C++/PyTorch): 343783.0/173913.6 elem/ms hc_head (T=   4,
-D=4096, bf16)           | C++   0.113ms | PyTorch   0.309ms | Compile   0.222ms | Speedup  2.73x | Throughput
-(C++/PyTorch): 578414.8/212145.8 elem/ms hc_head (T=   8, D=4096, bf16)           | C++   0.104ms | PyTorch   0.301ms |
-Compile   0.298ms | Speedup  2.90x | Throughput (C++/PyTorch): 1260178.0/435135.2 elem/ms hc_head (T=  16, D=4096, bf16)
-| C++   0.104ms | PyTorch   0.390ms | Compile   0.329ms | Speedup  3.73x | Throughput (C++/PyTorch): 2509406.2/672404.8
-elem/ms hc_head (T=  32, D=4096, bf16)           | C++   0.097ms | PyTorch   0.366ms | Compile   0.424ms |
-Speedup  3.77x | Throughput (C++/PyTorch): 5397378.8/1430811.0 elem/ms hc_head (T=  64, D=4096, bf16)           | C++
-0.120ms | PyTorch   0.510ms | Compile   0.487ms | Speedup  4.27x | Throughput (C++/PyTorch): 8765506.9/2054139.1 elem/ms
-  hc_head (T= 128, D=4096, bf16)           | C++   0.158ms | PyTorch   0.797ms | Compile   0.947ms | Speedup  5.05x |
-Throughput (C++/PyTorch): 13291896.2/2630667.4 elem/ms hc_head (T= 256, D=4096, bf16)           | C++   0.310ms |
-PyTorch   1.098ms | Compile   1.740ms | Speedup  3.55x | Throughput (C++/PyTorch): 13545595.9/3820009.5 elem/ms hc_head
-(T= 512, D=4096, bf16)           | C++   0.461ms | PyTorch   1.155ms | Compile   3.627ms | Speedup  2.50x | Throughput
-(C++/PyTorch): 18195168.2/7265114.3 elem/ms hc_head (T=1024, D=4096, bf16)           | C++   0.836ms | PyTorch   2.409ms
-| Compile   6.538ms | Speedup  2.88x | Throughput (C++/PyTorch): 20074772.8/6965367.8 elem/ms hc_head (T=2048, D=4096,
-bf16)           | C++   1.426ms | PyTorch   5.968ms | Compile  10.736ms | Speedup  4.18x | Throughput (C++/PyTorch):
-23524951.3/5622121.9 elem/ms hc_head (T=   1, D=7168, bf16)           | C++   0.104ms | PyTorch   0.209ms | Compile
-0.163ms | Speedup  2.01x | Throughput (C++/PyTorch): 276596.5/137295.1 elem/ms hc_head (T=   2, D=7168, bf16) | C++
-0.106ms | PyTorch   0.305ms | Compile   0.263ms | Speedup  2.87x | Throughput (C++/PyTorch): 539040.9/187814.8 elem/ms
-  hc_head (T=   4, D=7168, bf16)           | C++   0.123ms | PyTorch   0.311ms | Compile   0.319ms | Speedup  2.53x |
-Throughput (C++/PyTorch): 932931.8/369273.6 elem/ms hc_head (T=   8, D=7168, bf16)           | C++   0.097ms | PyTorch
-0.325ms | Compile   0.420ms | Speedup  3.35x | Throughput (C++/PyTorch): 2365699.0/705394.9 elem/ms hc_head (T=  16,
-D=7168, bf16)           | C++   0.095ms | PyTorch   0.367ms | Compile   0.474ms | Speedup  3.87x | Throughput
-(C++/PyTorch): 4835436.8/1248384.9 elem/ms hc_head (T=  32, D=7168, bf16)           | C++   0.111ms | PyTorch   0.350ms
-| Compile   0.464ms | Speedup  3.16x | Throughput (C++/PyTorch): 8271016.4/2618145.6 elem/ms hc_head (T=  64, D=7168,
-bf16)           | C++   0.157ms | PyTorch   0.701ms | Compile   0.801ms | Speedup  4.47x | Throughput (C++/PyTorch):
-11693949.9/2617120.5 elem/ms hc_head (T= 128, D=7168, bf16)           | C++   0.275ms | PyTorch   0.956ms |
-Compile   1.448ms | Speedup  3.47x | Throughput (C++/PyTorch): 13326454.6/3840891.6 elem/ms hc_head (T= 256, D=7168,
-bf16)           | C++   0.431ms | PyTorch   1.313ms | Compile   3.628ms | Speedup  3.05x | Throughput (C++/PyTorch):
-17045992.9/5589243.6 elem/ms hc_head (T= 512, D=7168, bf16)           | C++   0.730ms | PyTorch   2.820ms |
-Compile   5.946ms | Speedup  3.86x | Throughput (C++/PyTorch): 20106094.1/5204947.6 elem/ms hc_head (T=1024, D=7168,
-bf16)           | C++   1.373ms | PyTorch   4.842ms | Compile  10.568ms | Speedup  3.53x | Throughput (C++/PyTorch):
-21379404.4/6063276.0 elem/ms hc_head (T=2048, D=7168, bf16)           | C++   2.452ms | PyTorch  13.951ms |
-Compile  21.130ms | Speedup  5.69x | Throughput (C++/PyTorch): 23950461.6/4209158.7 elem/ms
-
-  hc_pre (T=   1, D=4096, bf16)            | C++   0.154ms | PyTorch   0.742ms | Compile   0.273ms | Speedup  4.82x |
-Throughput (C++/PyTorch): 106498.6/22080.4 elem/ms hc_pre (T=   2, D=4096, bf16)            | C++   0.132ms | PyTorch
-0.758ms | Compile   0.576ms | Speedup  5.75x | Throughput (C++/PyTorch): 248606.4/43217.0 elem/ms hc_pre (T=   4,
-D=4096, bf16)            | C++   0.167ms | PyTorch   0.891ms | Compile   0.686ms | Speedup  5.33x | Throughput
-(C++/PyTorch): 392145.5/73516.0 elem/ms hc_pre (T=   8, D=4096, bf16)            | C++   0.220ms | PyTorch   1.015ms |
-Compile   0.770ms | Speedup  4.62x | Throughput (C++/PyTorch): 595796.9/129099.7 elem/ms hc_pre (T=  16, D=4096, bf16)
-| C++   0.181ms | PyTorch   0.850ms | Compile   0.532ms | Speedup  4.70x | Throughput (C++/PyTorch): 1447737.5/308314.3
-elem/ms hc_pre (T=  32, D=4096, bf16)            | C++   0.220ms | PyTorch   0.958ms | Compile   0.636ms |
-Speedup  4.35x | Throughput (C++/PyTorch): 2382957.0/547539.9 elem/ms hc_pre (T=  64, D=4096, bf16)            | C++
-0.318ms | PyTorch   1.094ms | Compile   0.914ms | Speedup  3.45x | Throughput (C++/PyTorch): 3301949.4/958134.2 elem/ms
-  hc_pre (T= 128, D=4096, bf16)            | C++   0.562ms | PyTorch   1.524ms | Compile   1.308ms | Speedup  2.71x |
-Throughput (C++/PyTorch): 3731044.0/1375795.6 elem/ms hc_pre (T= 256, D=4096, bf16)            | C++   1.318ms | PyTorch
-2.833ms | Compile   1.936ms | Speedup  2.15x | Throughput (C++/PyTorch): 3183363.0/1480639.3 elem/ms hc_pre (T= 512,
-D=4096, bf16)            | C++   1.269ms | PyTorch   3.966ms | Compile   3.825ms | Speedup  3.12x | Throughput
-(C++/PyTorch): 6608361.8/2115244.1 elem/ms hc_pre (T=1024, D=4096, bf16)            | C++   2.813ms | PyTorch   8.007ms
-| Compile   6.177ms | Speedup  2.85x | Throughput (C++/PyTorch): 5964298.7/2095257.4 elem/ms hc_pre (T=2048, D=4096,
-bf16)            | C++   3.640ms | PyTorch  12.784ms | Compile  10.540ms | Speedup  3.51x | Throughput (C++/PyTorch):
-9218037.0/2624729.9 elem/ms hc_pre (T=   1, D=7168, bf16)            | C++   0.168ms | PyTorch   0.620ms | Compile
-0.284ms | Speedup  3.69x | Throughput (C++/PyTorch): 170671.0/46240.3 elem/ms hc_pre (T=   2, D=7168, bf16)            |
-C++   0.202ms | PyTorch   0.879ms | Compile   0.736ms | Speedup  4.36x | Throughput (C++/PyTorch): 284220.1/65228.0
-elem/ms hc_pre (T=   4, D=7168, bf16)            | C++   0.291ms | PyTorch   0.958ms | Compile   0.632ms |
-Speedup  3.29x | Throughput (C++/PyTorch): 393848.9/119666.6 elem/ms hc_pre (T=   8, D=7168, bf16)            | C++
-0.401ms | PyTorch   1.087ms | Compile   0.721ms | Speedup  2.71x | Throughput (C++/PyTorch): 571576.8/210967.1 elem/ms
-  hc_pre (T=  16, D=7168, bf16)            | C++   0.190ms | PyTorch   0.891ms | Compile   0.635ms | Speedup  4.69x |
-Throughput (C++/PyTorch): 2415980.5/515072.3 elem/ms hc_pre (T=  32, D=7168, bf16)            | C++   0.284ms | PyTorch
-1.017ms | Compile   0.846ms | Speedup  3.58x | Throughput (C++/PyTorch): 3229269.9/902179.9 elem/ms hc_pre (T=  64,
-D=7168, bf16)            | C++   0.466ms | PyTorch   1.261ms | Compile   1.184ms | Speedup  2.70x | Throughput
-(C++/PyTorch): 3935577.5/1455598.0 elem/ms hc_pre (T= 128, D=7168, bf16)            | C++   1.045ms | PyTorch   1.939ms
-| Compile   1.691ms | Speedup  1.86x | Throughput (C++/PyTorch): 3512468.8/1893084.6 elem/ms hc_pre (T= 256, D=7168,
-bf16)            | C++   1.483ms | PyTorch   2.780ms | Compile   2.394ms | Speedup  1.87x | Throughput (C++/PyTorch):
-4950380.6/2640724.1 elem/ms hc_pre (T= 512, D=7168, bf16)            | C++   2.165ms | PyTorch   5.255ms |
-Compile   4.928ms | Speedup  2.43x | Throughput (C++/PyTorch): 6779333.0/2793417.8 elem/ms hc_pre (T=1024, D=7168, bf16)
-| C++   3.908ms | PyTorch  10.994ms | Compile   8.506ms | Speedup  2.81x | Throughput (C++/PyTorch): 7512722.9/2670675.5
-elem/ms hc_pre (T=2048, D=7168, bf16)            | C++   5.502ms | PyTorch  21.117ms | Compile  20.515ms |
-Speedup  3.84x | Throughput (C++/PyTorch): 10672272.9/2780716.4 elem/ms
-
-  */
