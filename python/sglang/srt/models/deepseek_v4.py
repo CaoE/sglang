@@ -110,9 +110,15 @@ def apply_rotary_emb_cpu(
     positions: Optional[torch.Tensor] = None,
     inverse: bool = False,
 ) -> torch.Tensor:
-    return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
-        x, freqs_cis, inverse, positions
-    )
+    if positions is None:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu_no_positions(
+            x, freqs_cis, inverse
+        )
+    else:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu_positions(
+            x, freqs_cis, inverse, positions
+        )
+    return x
 
 
 if _is_cpu and _cpu_amx:
@@ -292,6 +298,8 @@ class MQALayer(nn.Module):
             beta_fast=rope_scaling["beta_fast"],
             beta_slow=rope_scaling["beta_slow"],
         )
+        if _is_cpu and _cpu_amx:
+            freqs_cis = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 

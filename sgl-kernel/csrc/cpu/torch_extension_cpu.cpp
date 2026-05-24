@@ -268,6 +268,25 @@ void topk_transform_512_cpu(
     int64_t page_size,
     const std::optional<at::Tensor>& out_raw_indices);
 
+void topk_transform_512_cpu_no_raw(
+    at::Tensor& scores,
+    at::Tensor& seq_lens,
+    at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size) {
+  topk_transform_512_cpu(scores, seq_lens, page_tables, out_page_indices, page_size, std::nullopt);
+}
+
+void topk_transform_512_cpu_with_raw(
+    at::Tensor& scores,
+    at::Tensor& seq_lens,
+    at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    at::Tensor& out_raw_indices) {
+  topk_transform_512_cpu(scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices);
+}
+
 at::Tensor fp8_paged_mqa_logits_cpu(
     at::Tensor& q_fp8,
     at::Tensor& kvcache_fp8,
@@ -387,12 +406,25 @@ at::Tensor causal_conv1d_update_cpu(
     int64_t pad_slot_id,
     bool is_vnni);
 
-at::Tensor apply_rotary_emb_interleaved_cpu(
+void apply_rotary_emb_interleaved_cpu(
     at::Tensor& x,
     at::Tensor& freqs,
     bool inverse,
     const std::optional<at::Tensor>& positions,
     const std::optional<at::Tensor>& k);
+
+void apply_rotary_emb_interleaved_cpu_no_positions(at::Tensor& x, at::Tensor& freqs, bool inverse) {
+  apply_rotary_emb_interleaved_cpu(x, freqs, inverse, std::nullopt, std::nullopt);
+}
+
+void apply_rotary_emb_interleaved_cpu_positions(at::Tensor& x, at::Tensor& freqs, bool inverse, at::Tensor& positions) {
+  apply_rotary_emb_interleaved_cpu(x, freqs, inverse, positions, std::nullopt);
+}
+
+void apply_rotary_emb_interleaved_cpu_positions_k(
+    at::Tensor& x, at::Tensor& freqs, bool inverse, at::Tensor& positions, at::Tensor& k) {
+  apply_rotary_emb_interleaved_cpu(x, freqs, inverse, positions, k);
+}
 
 // set_k_and_s
 void set_k_and_s_cpu(
@@ -737,9 +769,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // DeepSeek V4 compressed attention top-k transform
   m.def(
-      "topk_transform_512_cpu(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor(a!) out_page_indices, "
-      "int page_size, Tensor(a!)? out_raw_indices) -> ()");
-  m.impl("topk_transform_512_cpu", torch::kCPU, &topk_transform_512_cpu);
+      "topk_transform_512_cpu_no_raw(Tensor scores, Tensor seq_lens, Tensor page_tables, "
+      "Tensor(a!) out_page_indices, int page_size) -> ()");
+  m.impl("topk_transform_512_cpu_no_raw", torch::kCPU, &topk_transform_512_cpu_no_raw);
+  m.def(
+      "topk_transform_512_cpu_with_raw(Tensor scores, Tensor seq_lens, Tensor page_tables, "
+      "Tensor(a!) out_page_indices, int page_size, Tensor(b!) out_raw_indices) -> ()");
+  m.impl("topk_transform_512_cpu_with_raw", torch::kCPU, &topk_transform_512_cpu_with_raw);
 
   // DeepSeek V4 compressed attention FP8 paged MQA logits
   m.def(
@@ -804,10 +840,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 
   // rope
+  m.def("apply_rotary_emb_interleaved_cpu_no_positions(Tensor(a!) x, Tensor freqs, bool inverse) -> ()");
+  m.impl("apply_rotary_emb_interleaved_cpu_no_positions", torch::kCPU, &apply_rotary_emb_interleaved_cpu_no_positions);
+  m.def("apply_rotary_emb_interleaved_cpu_positions(Tensor(a!) x, Tensor freqs, bool inverse, Tensor positions) -> ()");
+  m.impl("apply_rotary_emb_interleaved_cpu_positions", torch::kCPU, &apply_rotary_emb_interleaved_cpu_positions);
   m.def(
-      "apply_rotary_emb_interleaved_cpu(Tensor(a!) x, Tensor freqs, bool inverse, Tensor? positions=None, Tensor(b!)? "
-      "k=None) -> Tensor(a!)");
-  m.impl("apply_rotary_emb_interleaved_cpu", torch::kCPU, &apply_rotary_emb_interleaved_cpu);
+      "apply_rotary_emb_interleaved_cpu_positions_k(Tensor(a!) x, Tensor freqs, bool inverse, Tensor positions, "
+      "Tensor(b!) k) -> ()");
+  m.impl("apply_rotary_emb_interleaved_cpu_positions_k", torch::kCPU, &apply_rotary_emb_interleaved_cpu_positions_k);
 
   // hadamard transform
   m.def("fast_hadamard_transform_cpu(Tensor x, float scale) -> Tensor");

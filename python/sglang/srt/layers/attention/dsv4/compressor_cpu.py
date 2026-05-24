@@ -23,9 +23,15 @@ def apply_rotary_emb_cpu(
     positions: Optional[torch.Tensor] = None,
     inverse: bool = False,
 ) -> torch.Tensor:
-    return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
-        x, freqs_cis, inverse, positions
-    )
+    if positions is None:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu_no_positions(
+            x, freqs_cis, inverse
+        )
+    else:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu_positions(
+            x, freqs_cis, inverse, positions
+        )
+    return x
 
 
 class CompressorCPU(_CompressorBase):

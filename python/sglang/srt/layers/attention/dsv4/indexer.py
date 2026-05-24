@@ -268,7 +268,16 @@ def topk_transform_512_cpu(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    torch.ops.sgl_kernel.topk_transform_512_cpu(
+    if out_raw_indices is None:
+        torch.ops.sgl_kernel.topk_transform_512_cpu_no_raw(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+        )
+        return
+    torch.ops.sgl_kernel.topk_transform_512_cpu_with_raw(
         scores,
         seq_lens,
         page_tables,

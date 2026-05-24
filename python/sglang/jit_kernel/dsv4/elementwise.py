@@ -103,9 +103,14 @@ def fused_rope_inplace(
             apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
         return
     elif _is_cpu and _cpu_amx:
-        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
-            q, freqs_cis, inverse, positions, k
-        )
+        if k is None:
+            torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu_positions(
+                q, freqs_cis, inverse, positions
+            )
+        else:
+            torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu_positions_k(
+                q, freqs_cis, inverse, positions, k
+            )
         return
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()

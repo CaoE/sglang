@@ -18,16 +18,19 @@
 from __future__ import annotations
 
 import bisect
+import copy
 import logging
+import operator
+import os
+import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import psutil
 import torch
 import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -56,27 +59,19 @@ def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
     num_tokens: int,
-    tp_group: GroupCoordinator,
+    backend: Optional[Callable] = None,
 ):
     """Patch the model to make it compatible with torch.compile"""
-    backup_ca_comm = None
-
-    try:
-        if enable_compile:
-            backup_ca_comm = tp_group.ca_comm
-            # Use custom-allreduce here.
-            # We found the custom allreduce is much faster than the built-in allreduce in torch,
-            # even with ENABLE_INTRA_NODE_COMM=1.
-            # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                dynamic=False,
-            )
-        else:
-            yield model.forward
-    finally:
-        if enable_compile:
-            tp_group.ca_comm = backup_ca_comm
+    if enable_compile:
+        compile_kwargs = {"dynamic": False}
+        if backend is not None:
+            compile_kwargs["backend"] = backend
+        yield torch.compile(
+            torch.no_grad()(model.forward),
+            **compile_kwargs,
+        )
+    else:
+        yield model.forward
 
 
 def set_torch_compile_config():
@@ -89,6 +84,237 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
     monkey_patch_torch_compile()
+
+
+def _get_cpu_compile_max_nodes_per_piece(model_runner: ModelRunner) -> int:
+    env_max_nodes = os.getenv("SGLANG_CPU_COMPILE_MAX_NODES_PER_PIECE")
+    if env_max_nodes is not None:
+        return max(1, int(env_max_nodes))
+    return 256
+
+
+def _use_cpu_piecewise_compile(model_runner: ModelRunner) -> bool:
+    flag = os.getenv("SGLANG_CPU_PIECEWISE_COMPILE")
+    if flag is None:
+        flag = os.getenv("SGLANG_CPU_REGIONAL_COMPILE_MODE")
+    if flag is not None:
+        return flag.strip().lower().replace("-", "_") not in {
+            "0",
+            "false",
+            "off",
+            "no",
+            "none",
+        }
+
+    hf_config = getattr(model_runner.model_config, "hf_config", None)
+    model_type = str(getattr(hf_config, "model_type", "")).lower()
+    architectures = getattr(hf_config, "architectures", []) or []
+    model_hint = f"{model_type} {' '.join(str(x).lower() for x in architectures)}"
+    return "deepseek" in model_hint
+
+
+def _compile_cpu_piecewise_subgraph(
+    graph: torch.fx.GraphModule,
+    example_inputs: tuple[Any, ...],
+    graph_index: int,
+    num_graphs: int,
+) -> Callable:
+    from torch._inductor.compile_fx import compile_fx
+
+    start_time = time.time()
+    num_nodes = len(list(graph.graph.nodes))
+    logger.info(
+        "Compiling CPU FX piece %s/%s with %s FX nodes",
+        graph_index + 1,
+        num_graphs,
+        num_nodes,
+    )
+    compiled_graph = compile_fx(
+        copy.deepcopy(graph),
+        list(example_inputs),
+        config_patches={
+            "fx_graph_cache": True,
+            "fx_graph_remote_cache": False,
+        },
+    )
+    logger.info(
+        "Compiled CPU FX piece %s/%s with %s FX nodes in %.2f s",
+        graph_index + 1,
+        num_graphs,
+        num_nodes,
+        time.time() - start_time,
+    )
+    return compiled_graph
+
+
+def _is_container_fx_value(node: torch.fx.Node) -> bool:
+    value = node.meta.get("val", node.meta.get("example_value"))
+    if isinstance(value, (tuple, list, dict)):
+        return True
+    return any(user.target is operator.getitem for user in node.users)
+
+
+def _is_compile_fx_safe_output(output: Any) -> bool:
+    if isinstance(output, torch.Tensor):
+        return True
+    if isinstance(output, (tuple, list)):
+        return all(isinstance(item, torch.Tensor) for item in output)
+    return False
+
+
+def _split_cpu_graph_by_node_count(
+    graph: torch.fx.GraphModule, max_nodes_per_piece: int
+) -> tuple[torch.fx.GraphModule, list[str]]:
+    """Split a topologically ordered FX graph into contiguous node-count pieces.
+
+    split_module preserves cross-piece values by lifting them to submodule
+    outputs and inputs in the parent graph.
+    """
+    nodes = [
+        node for node in graph.graph.nodes if node.op not in ("placeholder", "output")
+    ]
+    if not nodes:
+        return graph, []
+
+    max_nodes = max(1, int(max_nodes_per_piece))
+    node_positions = {node: index for index, node in enumerate(nodes)}
+    node_to_region = {}
+    region = 0
+    start = 0
+    while start < len(nodes):
+        end = min(start + max_nodes, len(nodes))
+        while True:
+            next_end = end
+            for node in nodes[start:end]:
+                if not _is_container_fx_value(node):
+                    continue
+                for user in node.users:
+                    user_pos = node_positions.get(user)
+                    if user_pos is not None:
+                        next_end = max(next_end, user_pos + 1)
+            if next_end == end:
+                break
+            end = next_end
+
+        for node in nodes[start:end]:
+            node_to_region[node] = region
+        region += 1
+        start = end
+
+    split_gm = torch.fx.passes.split_module.split_module(
+        graph,
+        None,
+        lambda node: node_to_region[node],
+        keep_original_order=True,
+    )
+    submod_names = []
+    for name, module in split_gm.named_modules():
+        if name == "" or "." in name:
+            continue
+        if not isinstance(module, torch.fx.GraphModule):
+            continue
+        submod_names.append(name)
+
+    submod_names.sort(key=lambda name: int(name.replace("submod_", "")))
+    split_gm.graph.lint()
+    for name in submod_names:
+        split_gm.get_submodule(name).graph.lint()
+    return split_gm, submod_names
+
+
+class _CPUPiecewiseCompileInterpreter(torch.fx.Interpreter):
+    def __init__(
+        self,
+        module: torch.fx.GraphModule,
+        compile_submod_names: list[str],
+    ):
+        super().__init__(module)
+        from torch._guards import detect_fake_mode
+
+        self.fake_mode = detect_fake_mode()
+        self.compile_submod_names = compile_submod_names
+        self.extra_traceback = False
+
+    def run(self, *args):
+        if self.fake_mode is None:
+            return super().run(*args)
+
+        from torch._dispatch.python import enable_python_dispatcher
+
+        fake_args = [
+            self.fake_mode.from_tensor(arg) if isinstance(arg, torch.Tensor) else arg
+            for arg in args
+        ]
+        old_allow_non_fake_inputs = getattr(
+            self.fake_mode, "allow_non_fake_inputs", None
+        )
+        if old_allow_non_fake_inputs is not None:
+            self.fake_mode.allow_non_fake_inputs = True
+        try:
+            with self.fake_mode, enable_python_dispatcher():
+                return super().run(*fake_args)
+        finally:
+            if old_allow_non_fake_inputs is not None:
+                self.fake_mode.allow_non_fake_inputs = old_allow_non_fake_inputs
+
+    def call_module(
+        self,
+        target: torch.fx.node.Target,
+        args: tuple[torch.fx.node.Argument, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        assert isinstance(target, str)
+        output = super().call_module(target, args, kwargs)
+
+        if target in self.compile_submod_names:
+            graph_index = self.compile_submod_names.index(target)
+            submod = self.fetch_attr(target)
+            assert isinstance(submod, torch.fx.GraphModule)
+            if not _is_compile_fx_safe_output(output):
+                logger.warning(
+                    "Skip CPU FX piece %s/%s Inductor compile because its output "
+                    "contains nested or non-tensor values",
+                    graph_index + 1,
+                    len(self.compile_submod_names),
+                )
+                return output
+            self.module.__dict__[target] = _compile_cpu_piecewise_subgraph(
+                submod,
+                args,
+                graph_index,
+                len(self.compile_submod_names),
+            )
+
+        return output
+
+
+class _CPUPiecewiseCompileBackend:
+    def __init__(self, max_nodes_per_piece: int):
+        self.max_nodes_per_piece = max(1, int(max_nodes_per_piece))
+
+    def __call__(
+        self,
+        graph: torch.fx.GraphModule,
+        example_inputs: list[Any],
+    ) -> Callable:
+        split_gm, submod_names = _split_cpu_graph_by_node_count(
+            graph,
+            self.max_nodes_per_piece,
+        )
+        if len(submod_names) <= 1:
+            logger.warning(
+                "CPU FX piecewise compile could not split the graph into multiple "
+                "regions; falling back to full Inductor compile"
+            )
+            return _compile_cpu_piecewise_subgraph(graph, tuple(example_inputs), 0, 1)
+
+        logger.info(
+            "Split CPU FX graph into %s pieces with max_nodes_per_piece=%s",
+            len(submod_names),
+            self.max_nodes_per_piece,
+        )
+        _CPUPiecewiseCompileInterpreter(split_gm, submod_names).run(*example_inputs)
+        return split_gm
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
@@ -122,6 +348,11 @@ def register_fake_ops():
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "set_k_and_s_cpu",
+        "set_k_cpu",
+        "set_s_cpu",
+        "topk_transform_512_cpu_no_raw",
+        "topk_transform_512_cpu_with_raw",
     ]
     for op in none_return_ops:
 
@@ -193,6 +424,20 @@ def register_fake_ops():
             return query, key
         else:
             return torch.empty_like(query), torch.empty_like(key)
+
+    for op in [
+        "apply_rotary_emb_interleaved_cpu_no_positions",
+        "apply_rotary_emb_interleaved_cpu_positions",
+        "apply_rotary_emb_interleaved_cpu_positions_k",
+    ]:
+
+        @torch.library.register_fake(f"sgl_kernel::{op}")
+        def _(*args, **kwargs):
+            return
+
+    @torch.library.register_fake("sgl_kernel::fast_hadamard_transform_cpu")
+    def _(x, scale):
+        return torch.empty_like(x)
 
     @torch.library.register_fake("sgl_kernel::multimodal_rotary_embedding_cpu")
     def _(
@@ -454,6 +699,157 @@ def register_fake_ops():
         beta = b.new_empty(1, batch, num_heads)
         return out, beta
 
+    @torch.library.register_fake("sgl_kernel::flash_mla_with_kvcache_cpu")
+    def _(
+        q,
+        k_cache,
+        head_dim_v,
+        softmax_scale,
+        indices,
+        topk_length,
+        attn_sink,
+        extra_k_cache,
+        extra_indices,
+        extra_topk_length,
+        is_fp8_kvcache,
+        fp8_layout,
+    ):
+        batch = q.shape[0]
+        seq_len = q.shape[1]
+        num_heads = q.shape[2]
+        out = q.new_empty((batch, seq_len, num_heads, head_dim_v))
+        lse = q.new_empty((batch, num_heads, seq_len), dtype=torch.float32)
+        return out, lse
+
+    @torch.library.register_fake("sgl_kernel::quant_to_nope_fp8_rope_bf16_pack_cpu")
+    def _(k_bf16):
+        num_tokens = k_bf16.shape[0]
+        quant_dim_nope = 448
+        quant_dim_rope = 64
+        quant_tile_size = 64
+        quant_num_tiles = quant_dim_nope // quant_tile_size
+        return (
+            torch.empty(
+                num_tokens,
+                quant_dim_nope,
+                dtype=torch.float8_e4m3fn,
+                device=k_bf16.device,
+            ),
+            torch.empty(
+                num_tokens,
+                quant_dim_rope,
+                dtype=torch.bfloat16,
+                device=k_bf16.device,
+            ),
+            torch.empty(
+                num_tokens,
+                quant_num_tiles,
+                dtype=torch.uint8,
+                device=k_bf16.device,
+            ),
+        )
+
+    @torch.library.register_fake("sgl_kernel::hash_topk_cpu")
+    def _(
+        gating_output,
+        tid2eid,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        num_experts,
+        routed_scaling_factor,
+    ):
+        num_tokens = gating_output.shape[0]
+        shape = (num_tokens, topk)
+        topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
+        topk_ids = torch.empty(shape, device=gating_output.device, dtype=torch.int)
+        return topk_weights, topk_ids
+
+    @torch.library.register_fake("sgl_kernel::biased_topk_cpu")
+    def _(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk,
+        renormalize,
+        scoring_func,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    ):
+        num_tokens = hidden_states.shape[0]
+        shape = (num_tokens, topk)
+        topk_weights = hidden_states.new_empty(shape, dtype=torch.float32)
+        topk_ids = torch.empty(shape, device=hidden_states.device, dtype=torch.int)
+        return topk_weights, topk_ids
+
+    @torch.library.register_fake("sgl_kernel::fp8_paged_mqa_logits_cpu")
+    def _(
+        q_fp8,
+        kvcache_fp8,
+        weight,
+        seq_lens,
+        page_table,
+        max_seq_len,
+        clean_logits,
+    ):
+        return q_fp8.new_empty((q_fp8.shape[0], max_seq_len), dtype=torch.float32)
+
+    @torch.library.register_fake("sgl_kernel::hc_pre_fused_cpu")
+    def _(x, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, rms_eps, hc_eps):
+        num_tokens = x.shape[0]
+        hidden_dim = x.shape[2]
+        y = x.new_empty((num_tokens, hidden_dim))
+        post = x.new_empty((num_tokens, hc_mult), dtype=torch.float32)
+        comb = x.new_empty((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+        return y, post, comb
+
+    @torch.library.register_fake("sgl_kernel::hc_post_fused_cpu")
+    def _(x, residual, post, comb):
+        num_tokens = x.shape[0]
+        hc = residual.shape[1]
+        hidden_dim = x.shape[1]
+        return x.new_empty((num_tokens, hc, hidden_dim))
+
+    @torch.library.register_fake("sgl_kernel::hc_head_fused_cpu")
+    def _(x, hc_fn, hc_scale, hc_base, hc_eps, norm_eps):
+        num_tokens = x.shape[0]
+        hidden_dim = x.shape[2]
+        return x.new_empty((num_tokens, hidden_dim))
+
+    @torch.library.register_fake("sgl_kernel::compress_decode_cpu")
+    def _(
+        pool_kv,
+        pool_score,
+        kv,
+        score,
+        seq_lens,
+        req_pool_indices,
+        ape,
+        norm_weight,
+        freqs_cis,
+        ratio,
+        head_dim,
+        rope_head_dim,
+        overlap,
+        rotate,
+        norm_eps,
+    ):
+        return pool_kv.new_empty((seq_lens.shape[0], head_dim))
+
+    @torch.library.register_fake("sgl_kernel::act_quant_cpu")
+    def _(x, block_size=128, scale_fmt=None):
+        scale_shape = list(x.shape)
+        scale_shape[-1] = (scale_shape[-1] + block_size - 1) // block_size
+        return (
+            torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            torch.empty(scale_shape, dtype=torch.float32, device=x.device),
+        )
+
+    @torch.library.register_fake("sgl_kernel::fused_scale_cpu")
+    def _(weight, out_scale, q_scale):
+        return weight.new_empty((*weight.shape, 1), dtype=torch.float32)
+
     @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
     def _(
         query,
@@ -507,6 +903,8 @@ class CPUGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        self.cpu_compile_max_nodes_per_piece = 1
+        self.cpu_piecewise_backend = None
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -555,6 +953,18 @@ class CPUGraphRunner:
         if self.enable_torch_compile:
             register_fake_ops()
             set_torch_compile_config()
+            if _use_cpu_piecewise_compile(model_runner):
+                self.cpu_compile_max_nodes_per_piece = (
+                    _get_cpu_compile_max_nodes_per_piece(model_runner)
+                )
+                self.cpu_piecewise_backend = _CPUPiecewiseCompileBackend(
+                    self.cpu_compile_max_nodes_per_piece
+                )
+                log_info_on_rank0(
+                    logger,
+                    "Enable CPU graph FX piecewise torch.compile: "
+                    f"max_nodes_per_piece={self.cpu_compile_max_nodes_per_piece}",
+                )
 
         # Graph inputs
         with torch.device(self.device):
@@ -624,7 +1034,7 @@ class CPUGraphRunner:
                 self.model_runner.model,
                 bs in self.capture_bs,
                 num_tokens=bs * self.num_tokens_per_bs,
-                tp_group=self.model_runner.tp_group,
+                backend=self.cpu_piecewise_backend,
             ) as forward:
                 (
                     graph,
@@ -763,6 +1173,39 @@ class CPUGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def _init_forward_metadata_replay(
+        self,
+        prepared_forward_batch: ForwardBatch,
+        actual_forward_batch: ForwardBatch,
+    ) -> None:
+        if hasattr(
+            self.model_runner.attn_backend,
+            "init_forward_metadata_replay_cpu_graph",
+        ):
+            assert actual_forward_batch.forward_mode.is_decode(), (
+                "CPUGraphRunner only supports decode graph replay for this "
+                f"CPU graph metadata path, got {actual_forward_batch.forward_mode=}"
+            )
+            seq_lens_cpu = (
+                prepared_forward_batch.seq_lens_cpu
+                if prepared_forward_batch.seq_lens_cpu is not None
+                else prepared_forward_batch.seq_lens
+            )
+            self.model_runner.attn_backend.init_forward_metadata_replay_cpu_graph(
+                bs=prepared_forward_batch.batch_size,
+                req_pool_indices=prepared_forward_batch.req_pool_indices,
+                seq_lens=prepared_forward_batch.seq_lens,
+                seq_lens_sum=prepared_forward_batch.seq_lens_sum,
+                encoder_lens=None,
+                forward_mode=self.capture_forward_mode,
+                spec_info=actual_forward_batch.spec_info,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=prepared_forward_batch.out_cache_loc,
+                actual_forward_mode=actual_forward_batch.forward_mode,
+            )
+        else:
+            self.model_runner.attn_backend.init_forward_metadata(prepared_forward_batch)
+
     def prepare_replay(
         self,
         forward_batch: ForwardBatch,
@@ -771,7 +1214,7 @@ class CPUGraphRunner:
 
         raw_bs = forward_batch.batch_size
         if raw_bs in self.graphs:
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._init_forward_metadata_replay(forward_batch, forward_batch)
             return forward_batch
 
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -807,7 +1250,7 @@ class CPUGraphRunner:
                 forward_batch.num_token_non_padded
             )
 
-        self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
+        self._init_forward_metadata_replay(captured_forward_batch, forward_batch)
         return captured_forward_batch
 
     def replay(
