@@ -298,6 +298,7 @@ class MQALayer(nn.Module):
             beta_fast=rope_scaling["beta_fast"],
             beta_slow=rope_scaling["beta_slow"],
         )
+        # This is for cpu graph to avoid "auto_functionalized_v2 was not removed"
         if _is_cpu and _cpu_amx:
             freqs_cis = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)

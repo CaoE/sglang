@@ -18,19 +18,16 @@
 from __future__ import annotations
 
 import bisect
-import copy
 import logging
-import operator
-import os
-import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import psutil
 import torch
 import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -54,24 +51,97 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+_CPU_COMPILE_FALLBACK_OPS = (
+    "act_quant_cpu",
+    "apply_rotary_emb_interleaved_cpu_no_positions",
+    "apply_rotary_emb_interleaved_cpu_positions",
+    "apply_rotary_emb_interleaved_cpu_positions_k",
+    "biased_grouped_topk_cpu",
+    "biased_topk_cpu",
+    "bmm_cpu",
+    "causal_conv1d_fwd_cpu",
+    "causal_conv1d_update_cpu",
+    "chunk_gated_delta_rule_cpu",
+    "compress_decode_cpu",
+    "decode_attention_cpu",
+    "extend_attention_cpu",
+    "fast_hadamard_transform_cpu",
+    "flash_mla_with_kvcache_cpu",
+    "fp8_paged_mqa_logits_cpu",
+    "fp8_scaled_mm_cpu",
+    "fused_add_layernorm_cpu",
+    "fused_add_rmsnorm_cpu",
+    "fused_experts_cpu",
+    "fused_gdn_gating_cpu",
+    "fused_linear_sigmoid_mul",
+    "fused_qkvzba_split_reshape_cat_contiguous_cpu",
+    "fused_qkvzba_split_reshape_cat_cpu",
+    "fused_rmsnorm_gated_cpu",
+    "fused_scale_cpu",
+    "fused_sigmoid_gating_delta_rule_update_cpu",
+    "gemma3_rmsnorm_cpu",
+    "gemma4_rmsnorm_cpu",
+    "gemma_fused_add_rmsnorm_cpu",
+    "gemma_rmsnorm_cpu",
+    "grouped_topk_cpu",
+    "hash_topk_cpu",
+    "hc_head_fused_cpu",
+    "hc_post_fused_cpu",
+    "hc_pre_fused_cpu",
+    "int8_scaled_mm_cpu",
+    "int8_scaled_mm_with_quant",
+    "l2norm_cpu",
+    "layernorm_cpu",
+    "multimodal_rotary_embedding_cpu",
+    "per_token_quant_int8_cpu",
+    "qkv_proj_with_rope",
+    "qkv_proj_with_rope_fused_weight",
+    "quant_to_nope_fp8_rope_bf16_pack_cpu",
+    "rmsnorm_cpu",
+    "rotary_embedding_cpu",
+    "set_k_and_s_cpu",
+    "set_k_cpu",
+    "set_s_cpu",
+    "shared_expert_cpu",
+    "shm_allgather",
+    "shm_allreduce",
+    "silu_and_mul_cpu",
+    "gelu_tanh_and_mul_cpu",
+    "gelu_and_mul_cpu",
+    "topk_sigmoid_cpu",
+    "topk_softmax_cpu",
+    "topk_transform_512_cpu_no_raw",
+    "topk_transform_512_cpu_with_raw",
+    "weight_packed_linear",
+)
+
+
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
     num_tokens: int,
-    backend: Optional[Callable] = None,
+    tp_group: GroupCoordinator,
 ):
     """Patch the model to make it compatible with torch.compile"""
-    if enable_compile:
-        compile_kwargs = {"dynamic": False}
-        if backend is not None:
-            compile_kwargs["backend"] = backend
-        yield torch.compile(
-            torch.no_grad()(model.forward),
-            **compile_kwargs,
-        )
-    else:
-        yield model.forward
+    backup_ca_comm = None
+
+    try:
+        if enable_compile:
+            backup_ca_comm = tp_group.ca_comm
+            # Use custom-allreduce here.
+            # We found the custom allreduce is much faster than the built-in allreduce in torch,
+            # even with ENABLE_INTRA_NODE_COMM=1.
+            # tp_group.ca_comm = None
+            yield torch.compile(
+                torch.no_grad()(model.forward),
+                dynamic=False,
+            )
+        else:
+            yield model.forward
+    finally:
+        if enable_compile:
+            tp_group.ca_comm = backup_ca_comm
 
 
 def set_torch_compile_config():
@@ -83,238 +153,21 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+    register_inductor_fallback_ops()
     monkey_patch_torch_compile()
 
 
-def _get_cpu_compile_max_nodes_per_piece(model_runner: ModelRunner) -> int:
-    env_max_nodes = os.getenv("SGLANG_CPU_COMPILE_MAX_NODES_PER_PIECE")
-    if env_max_nodes is not None:
-        return max(1, int(env_max_nodes))
-    return 256
+def register_inductor_fallback_ops():
+    from torch._inductor.lowering import lowerings, make_fallback
 
-
-def _use_cpu_piecewise_compile(model_runner: ModelRunner) -> bool:
-    flag = os.getenv("SGLANG_CPU_PIECEWISE_COMPILE")
-    if flag is None:
-        flag = os.getenv("SGLANG_CPU_REGIONAL_COMPILE_MODE")
-    if flag is not None:
-        return flag.strip().lower().replace("-", "_") not in {
-            "0",
-            "false",
-            "off",
-            "no",
-            "none",
-        }
-
-    hf_config = getattr(model_runner.model_config, "hf_config", None)
-    model_type = str(getattr(hf_config, "model_type", "")).lower()
-    architectures = getattr(hf_config, "architectures", []) or []
-    model_hint = f"{model_type} {' '.join(str(x).lower() for x in architectures)}"
-    return "deepseek" in model_hint
-
-
-def _compile_cpu_piecewise_subgraph(
-    graph: torch.fx.GraphModule,
-    example_inputs: tuple[Any, ...],
-    graph_index: int,
-    num_graphs: int,
-) -> Callable:
-    from torch._inductor.compile_fx import compile_fx
-
-    start_time = time.time()
-    num_nodes = len(list(graph.graph.nodes))
-    logger.info(
-        "Compiling CPU FX piece %s/%s with %s FX nodes",
-        graph_index + 1,
-        num_graphs,
-        num_nodes,
-    )
-    compiled_graph = compile_fx(
-        copy.deepcopy(graph),
-        list(example_inputs),
-        config_patches={
-            "fx_graph_cache": True,
-            "fx_graph_remote_cache": False,
-        },
-    )
-    logger.info(
-        "Compiled CPU FX piece %s/%s with %s FX nodes in %.2f s",
-        graph_index + 1,
-        num_graphs,
-        num_nodes,
-        time.time() - start_time,
-    )
-    return compiled_graph
-
-
-def _is_container_fx_value(node: torch.fx.Node) -> bool:
-    value = node.meta.get("val", node.meta.get("example_value"))
-    if isinstance(value, (tuple, list, dict)):
-        return True
-    return any(user.target is operator.getitem for user in node.users)
-
-
-def _is_compile_fx_safe_output(output: Any) -> bool:
-    if isinstance(output, torch.Tensor):
-        return True
-    if isinstance(output, (tuple, list)):
-        return all(isinstance(item, torch.Tensor) for item in output)
-    return False
-
-
-def _split_cpu_graph_by_node_count(
-    graph: torch.fx.GraphModule, max_nodes_per_piece: int
-) -> tuple[torch.fx.GraphModule, list[str]]:
-    """Split a topologically ordered FX graph into contiguous node-count pieces.
-
-    split_module preserves cross-piece values by lifting them to submodule
-    outputs and inputs in the parent graph.
-    """
-    nodes = [
-        node for node in graph.graph.nodes if node.op not in ("placeholder", "output")
-    ]
-    if not nodes:
-        return graph, []
-
-    max_nodes = max(1, int(max_nodes_per_piece))
-    node_positions = {node: index for index, node in enumerate(nodes)}
-    node_to_region = {}
-    region = 0
-    start = 0
-    while start < len(nodes):
-        end = min(start + max_nodes, len(nodes))
-        while True:
-            next_end = end
-            for node in nodes[start:end]:
-                if not _is_container_fx_value(node):
-                    continue
-                for user in node.users:
-                    user_pos = node_positions.get(user)
-                    if user_pos is not None:
-                        next_end = max(next_end, user_pos + 1)
-            if next_end == end:
-                break
-            end = next_end
-
-        for node in nodes[start:end]:
-            node_to_region[node] = region
-        region += 1
-        start = end
-
-    split_gm = torch.fx.passes.split_module.split_module(
-        graph,
-        None,
-        lambda node: node_to_region[node],
-        keep_original_order=True,
-    )
-    submod_names = []
-    for name, module in split_gm.named_modules():
-        if name == "" or "." in name:
-            continue
-        if not isinstance(module, torch.fx.GraphModule):
-            continue
-        submod_names.append(name)
-
-    submod_names.sort(key=lambda name: int(name.replace("submod_", "")))
-    split_gm.graph.lint()
-    for name in submod_names:
-        split_gm.get_submodule(name).graph.lint()
-    return split_gm, submod_names
-
-
-class _CPUPiecewiseCompileInterpreter(torch.fx.Interpreter):
-    def __init__(
-        self,
-        module: torch.fx.GraphModule,
-        compile_submod_names: list[str],
-    ):
-        super().__init__(module)
-        from torch._guards import detect_fake_mode
-
-        self.fake_mode = detect_fake_mode()
-        self.compile_submod_names = compile_submod_names
-        self.extra_traceback = False
-
-    def run(self, *args):
-        if self.fake_mode is None:
-            return super().run(*args)
-
-        from torch._dispatch.python import enable_python_dispatcher
-
-        fake_args = [
-            self.fake_mode.from_tensor(arg) if isinstance(arg, torch.Tensor) else arg
-            for arg in args
-        ]
-        old_allow_non_fake_inputs = getattr(
-            self.fake_mode, "allow_non_fake_inputs", None
-        )
-        if old_allow_non_fake_inputs is not None:
-            self.fake_mode.allow_non_fake_inputs = True
+    sgl_kernel_ops = torch.ops.sgl_kernel
+    for op_name in _CPU_COMPILE_FALLBACK_OPS:
         try:
-            with self.fake_mode, enable_python_dispatcher():
-                return super().run(*fake_args)
-        finally:
-            if old_allow_non_fake_inputs is not None:
-                self.fake_mode.allow_non_fake_inputs = old_allow_non_fake_inputs
-
-    def call_module(
-        self,
-        target: torch.fx.node.Target,
-        args: tuple[torch.fx.node.Argument, ...],
-        kwargs: dict[str, Any],
-    ) -> Any:
-        assert isinstance(target, str)
-        output = super().call_module(target, args, kwargs)
-
-        if target in self.compile_submod_names:
-            graph_index = self.compile_submod_names.index(target)
-            submod = self.fetch_attr(target)
-            assert isinstance(submod, torch.fx.GraphModule)
-            if not _is_compile_fx_safe_output(output):
-                logger.warning(
-                    "Skip CPU FX piece %s/%s Inductor compile because its output "
-                    "contains nested or non-tensor values",
-                    graph_index + 1,
-                    len(self.compile_submod_names),
-                )
-                return output
-            self.module.__dict__[target] = _compile_cpu_piecewise_subgraph(
-                submod,
-                args,
-                graph_index,
-                len(self.compile_submod_names),
-            )
-
-        return output
-
-
-class _CPUPiecewiseCompileBackend:
-    def __init__(self, max_nodes_per_piece: int):
-        self.max_nodes_per_piece = max(1, int(max_nodes_per_piece))
-
-    def __call__(
-        self,
-        graph: torch.fx.GraphModule,
-        example_inputs: list[Any],
-    ) -> Callable:
-        split_gm, submod_names = _split_cpu_graph_by_node_count(
-            graph,
-            self.max_nodes_per_piece,
-        )
-        if len(submod_names) <= 1:
-            logger.warning(
-                "CPU FX piecewise compile could not split the graph into multiple "
-                "regions; falling back to full Inductor compile"
-            )
-            return _compile_cpu_piecewise_subgraph(graph, tuple(example_inputs), 0, 1)
-
-        logger.info(
-            "Split CPU FX graph into %s pieces with max_nodes_per_piece=%s",
-            len(submod_names),
-            self.max_nodes_per_piece,
-        )
-        _CPUPiecewiseCompileInterpreter(split_gm, submod_names).run(*example_inputs)
-        return split_gm
+            op = getattr(getattr(sgl_kernel_ops, op_name), "default")
+        except AttributeError:
+            continue
+        if op not in lowerings:
+            make_fallback(op, warn=False)
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
@@ -903,8 +756,6 @@ class CPUGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        self.cpu_compile_max_nodes_per_piece = 1
-        self.cpu_piecewise_backend = None
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -953,18 +804,6 @@ class CPUGraphRunner:
         if self.enable_torch_compile:
             register_fake_ops()
             set_torch_compile_config()
-            if _use_cpu_piecewise_compile(model_runner):
-                self.cpu_compile_max_nodes_per_piece = (
-                    _get_cpu_compile_max_nodes_per_piece(model_runner)
-                )
-                self.cpu_piecewise_backend = _CPUPiecewiseCompileBackend(
-                    self.cpu_compile_max_nodes_per_piece
-                )
-                log_info_on_rank0(
-                    logger,
-                    "Enable CPU graph FX piecewise torch.compile: "
-                    f"max_nodes_per_piece={self.cpu_compile_max_nodes_per_piece}",
-                )
 
         # Graph inputs
         with torch.device(self.device):
@@ -1034,7 +873,7 @@ class CPUGraphRunner:
                 self.model_runner.model,
                 bs in self.capture_bs,
                 num_tokens=bs * self.num_tokens_per_bs,
-                backend=self.cpu_piecewise_backend,
+                tp_group=self.model_runner.tp_group,
             ) as forward:
                 (
                     graph,
