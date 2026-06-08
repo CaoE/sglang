@@ -232,6 +232,10 @@ def register_fake_ops(tp_size: int):
         w2_zero,
         a1_scale,
         block_size,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
         is_vnni,
         activation=None,
     ):
@@ -256,6 +260,7 @@ def register_fake_ops(tp_size: int):
         q_a_proj_scale,
         q_b_proj_scale,
         kv_a_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
     ):
