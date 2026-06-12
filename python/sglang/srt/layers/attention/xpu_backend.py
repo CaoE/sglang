@@ -1001,6 +1001,111 @@ class XPUAttentionBackend(AttentionBackend):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Pre-allocate fixed-size tensors reused across XPU graph captures."""
+        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        self.decode_cuda_graph_metadata = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "page_table": torch.zeros(
+                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
+            ),
+        }
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens,
+        forward_mode: ForwardMode,
+        spec_info,
+    ):
+        """Set up metadata for XPU graph capture at a given batch size.
+
+        Only DECODE mode without speculative decoding is supported.
+        Metadata tensors are slices of the pre-allocated buffers so that
+        in-place updates during replay propagate to the captured GPU kernels.
+        """
+        assert (
+            spec_info is None
+        ), "XPUAttentionBackend does not support speculative decoding in XPU graph"
+        assert forward_mode.is_decode_or_idle(), (
+            "XPUAttentionBackend XPU graph only supports decode mode"
+        )
+
+        metadata = FlashAttentionMetadata()
+        metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+            "cache_seqlens"
+        ][:bs]
+        metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
+            : bs + 1
+        ]
+        metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
+            : bs + 1
+        ]
+        metadata.page_table = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+        metadata.max_seq_len_k = seq_lens.max().item()
+        # max_seq_len_q is left as None: single-token decode per request
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens,
+        forward_mode: ForwardMode,
+        spec_info,
+        seq_lens_cpu,
+    ):
+        """Update pre-allocated metadata tensors in-place before graph replay."""
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
+        req_pool_indices = req_pool_indices[:bs]
+
+        metadata = self.decode_cuda_graph_metadata[bs]
+        max_len = (
+            seq_lens_cpu.max().item()
+            if seq_lens_cpu is not None
+            else seq_lens.max().item()
+        )
+        metadata.max_seq_len_k = max_len
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+        # Update cache_seqlens in-place
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+        # Update cu_seqlens_k in-place
+        metadata.cu_seqlens_k[0] = 0
+        metadata.cu_seqlens_k[1 : bs + 1].copy_(
+            torch.cumsum(seq_lens.to(torch.int32), dim=0)
+        )
+
+        # Update page_table in-place
+        strided_indices = self.decode_cuda_graph_metadata["strided_indices"][
+            :max_seq_pages
+        ]
+        raw_page = self.req_to_token[
+            req_pool_indices[:, None], strided_indices[None, :]
+        ]
+        if self.page_size > 1:
+            raw_page = raw_page // self.page_size
+        metadata.page_table[:bs, :max_seq_pages].copy_(raw_page.to(torch.int32))
+
+        self.forward_metadata = metadata
+
     def _init_local_attn_metadata(
         self,
         forwardbatch: ForwardBatch,

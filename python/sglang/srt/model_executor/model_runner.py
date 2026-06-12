@@ -176,6 +176,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -835,7 +836,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.kernel_warmup()
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_decode_cuda_graph()
-        elif self.device == "cpu":
+        elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
             self.init_decode_cuda_graph()
         elif self.device == "npu":
@@ -2895,6 +2896,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "musa": "cuda graph",
                 "cpu": "cpu graph",
                 "npu": "npu graph",
+                "xpu": "xpu graph",
             },
         )
         logger.info(
@@ -2913,6 +2915,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 {
                     "cpu": CPUGraphRunner,
                     "npu": NPUGraphRunner,
+                    "xpu": XPUGraphRunner,
                 },
             )
             self.decode_cuda_graph_runner = graph_runners[self.device](self)
