@@ -16,18 +16,14 @@
 from __future__ import annotations
 
 import logging
-from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 # from sglang.srt.layers.attention.fla.layernorm_gated import prefetch_sm_count
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +96,7 @@ def register_fake_ops():
         return
 
 
-class XPUGraphRunner(CudaGraphRunner):
+class XPUGraphRunner(DecodeCudaGraphRunner):
     """A XPUGraphRunner runs the forward pass of a model with xpu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
@@ -111,18 +107,6 @@ class XPUGraphRunner(CudaGraphRunner):
         # # because _XpuDeviceProperties is not a supported ConstantVariable type.
         # prefetch_sm_count(torch.device("xpu", model_runner.gpu_id))
         super().__init__(model_runner)
-
-        # model_runner.server_args.disable_cuda_graph_padding
-        # require_attn_tp_gather(model_runner.server_args)
-        # model_runner.server_args.enable_pdmux
-
-        # assert (
-        #     self.model_runner.server_args.disable_piecewise_cuda_graph
-        # ), "XPUGraphRunner does not support Piecewise Graph yet."
-
-        # assert (
-        #     not self.model_runner.server_args.enforce_piecewise_cuda_graph
-        # ), "XPUGraphRunner does not support forced enabling Piecewise Graph yet."
 
         assert (
             not self.model_runner.server_args.enable_memory_saver
@@ -152,74 +136,6 @@ class XPUGraphRunner(CudaGraphRunner):
         ), "XPUGraphRunner does not support encoder-decoder models yet."
         assert self.dp_size == 1, "XPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "XPUGraphRunner does not support PP yet."
-
-    def _create_device_graph(self):
-        return torch.xpu.XPUGraph()
-
-    # def replay(
-    #     self,
-    #     forward_batch: ForwardBatch,
-    #     skip_attn_backend_init: bool = False,
-    #     pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    # ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-    #     # During extend (prefill), dist.all_reduce triggers OneCCL to call
-    #     # begin_recording() on the default stream (confirmed by ARDebug log).
-    #     # XPUGraph.replay() C++ checks the current stream's capture status
-    #     # before executing. Since replay() is called with no stream context
-    #     # manager active, current stream == default stream == the same stream
-    #     # that OneCCL's recording is on.
-    #     # Poll is_capturing() (pure CPU-side, no queue.wait()) until the
-    #     # recording ends, then replay.
-    #     import time
-    #     cs = torch.xpu.current_stream()
-    #     if cs.is_capturing():
-    #         t0 = time.monotonic()
-    #         while cs.is_capturing():
-    #             if time.monotonic() - t0 > 30.0:
-    #                 logger.warning(
-    #                     "XPU default stream still in OneCCL recording state after 30s; "
-    #                     "proceeding with graph replay."
-    #                 )
-    #                 break
-    #             time.sleep(0.001)
-    #     return super().replay(forward_batch, skip_attn_backend_init, pp_proxy_tensors)
-
-    def _capture_graph(self, graph, pool, stream, run_once_fn):
-        # import os
-        # _debug = os.environ.get("SGLANG_XPU_GRAPH_DEBUG", "0") == "1"
-        # if _debug:
-        #     cs = torch.xpu.current_stream()
-        #     logger.warning(
-        #         f"[XPUGraphDebug] _capture_graph ENTER: current_stream={cs.sycl_queue:#x} "
-        #         f"capture_stream={stream.sycl_queue:#x} is_capturing={cs.is_capturing()}"
-        #     )
-        #     graph.enable_debug_mode()
-
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.model_runner.server_args.enable_memory_saver
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
-        )
-        graph_fn = (
-            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
-            if memory_saver_adapter.enabled
-            else self.device_module.graph
-        )
-        with graph_fn(xpu_graph=graph, pool=pool, stream=stream):
-            # if _debug:
-            #     cs_in = torch.xpu.current_stream()
-            #     logger.warning(
-            #         f"[XPUGraphDebug] inside graph context: current_stream={cs_in.sycl_queue:#x} "
-            #         f"is_capturing={cs_in.is_capturing()}"
-            #     )
-            out = run_once_fn()
-
-        # if _debug:
-        #     cs_out = torch.xpu.current_stream()
-        #     logger.warning(
-        #         f"[XPUGraphDebug] _capture_graph EXIT: current_stream={cs_out.sycl_queue:#x} "
-        #         f"is_capturing={cs_out.is_capturing()}"
-        #     )
-        return out
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
