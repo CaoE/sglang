@@ -480,7 +480,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc(cache_loc, getattr(self.forward_metadata, 'swa_out_cache_loc', None)),
                         k,
                         v,
                         layer.k_scale,
@@ -787,7 +787,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc(cache_loc, getattr(self.forward_metadata, 'swa_out_cache_loc', None)),
                         k,
                         v,
                         layer.k_scale,
@@ -1000,6 +1000,107 @@ class XPUAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Pre-allocate fixed-size tensors reused across XPU graph captures."""
+        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        self.decode_cuda_graph_metadata = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "page_table": torch.zeros(
+                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
+            ),
+        }
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """New unified graph capture/replay entry point (replaces the legacy
+        init_forward_metadata_capture_cuda_graph /
+        init_forward_metadata_replay_cuda_graph pair).
+
+        Called by DecodeCudaGraphRunner:
+          - capture: in_capture=True  → bind static metadata buffers
+          - replay:  in_capture=False → update pre-allocated buffers in-place
+          - eager:   via init_forward_metadata() default wrapper
+        """
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        assert (
+            spec_info is None
+        ), "XPUAttentionBackend does not support speculative decoding in XPU graph"
+        assert forward_mode.is_decode_or_idle(), (
+            "XPUAttentionBackend XPU graph only supports decode mode"
+        )
+
+        if in_capture:
+            # Bind static-shape slices of the pre-allocated buffers.
+            metadata = FlashAttentionMetadata()
+            metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                "cache_seqlens"
+            ][:bs]
+            metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
+                : bs + 1
+            ]
+            metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
+                : bs + 1
+            ]
+            metadata.page_table = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+            metadata.max_seq_len_k = seq_lens.max().item()
+            self.decode_cuda_graph_metadata[bs] = metadata
+            self.forward_metadata = metadata
+        else:
+            # Update pre-allocated metadata tensors in-place before replay.
+            seq_lens = seq_lens[:bs]
+            seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
+            req_pool_indices = req_pool_indices[:bs]
+
+            metadata = self.decode_cuda_graph_metadata[bs]
+            max_len = (
+                seq_lens_cpu.max().item()
+                if seq_lens_cpu is not None
+                else seq_lens.max().item()
+            )
+            metadata.max_seq_len_k = max_len
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+            metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+            metadata.cu_seqlens_k[0] = 0
+            metadata.cu_seqlens_k[1 : bs + 1].copy_(
+                torch.cumsum(seq_lens.to(torch.int32), dim=0)
+            )
+
+            strided_indices = self.decode_cuda_graph_metadata["strided_indices"][
+                :max_seq_pages
+            ]
+            raw_page = self.req_to_token[
+                req_pool_indices[:, None], strided_indices[None, :]
+            ]
+            if self.page_size > 1:
+                raw_page = raw_page // self.page_size
+            metadata.page_table[:bs, :max_seq_pages].copy_(raw_page.to(torch.int32))
+
+            self.forward_metadata = metadata
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """Graph-recordable ops for XPU graph (no-op: all metadata setup is
+        host-side and lives in init_forward_metadata_out_graph)."""
 
     def _init_local_attn_metadata(
         self,
