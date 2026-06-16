@@ -99,13 +99,44 @@ def register_fake_ops():
 class XPUGraphRunner(DecodeCudaGraphRunner):
     """A XPUGraphRunner runs the forward pass of a model with xpu graph and torch.compile."""
 
+    @staticmethod
+    def _apply_xpu_compile_config() -> None:
+        """Apply XPU-specific torch.compile / dynamo settings.
+
+        Called unconditionally before super().__init__() so that the settings
+        are in place regardless of whether --enable-torch-compile is passed.
+        The critical flag is suppress_errors: when the Intel IGC compiler
+        crashes with SIGFPE on certain reduction kernels (ocloc -device bmg
+        returns exit code 245), dynamo falls back to eager for that subgraph
+        instead of propagating the crash.
+        """
+        import torch._dynamo.config
+
+        torch._dynamo.config.suppress_errors = True
+
+    @staticmethod
+    def _register_xpu_device_properties_for_dynamo() -> None:
+        """Teach Dynamo to treat ``_XpuDeviceProperties`` as a constant type.
+
+        Dynamo already special-cases ``torch.cuda._CudaDeviceProperties`` by
+        listing it in ``torch._dynamo.utils.common_constant_types``, so code like
+        ``torch.cuda.get_device_properties(dev).multi_processor_count`` can be
+        folded into a constant during tracing.  The XPU counterpart
+        ``torch.xpu._XpuDeviceProperties`` is not registered, so the equivalent
+        ``torch.xpu.get_device_properties(dev).gpu_subslice_count`` fails with
+        "SourcelessBuilder.create does not know how to wrap _XpuDeviceProperties".
+        Add the XPU type to the same set so it is wrapped as a ConstantVariable.
+        """
+        import torch._dynamo.utils as dynamo_utils
+
+        xpu_props_type = getattr(torch.xpu, "_XpuDeviceProperties", None)
+        if xpu_props_type is not None:
+            dynamo_utils.common_constant_types.add(xpu_props_type)
+
     def __init__(self, model_runner: ModelRunner):
         register_fake_ops()
-        # # Pre-fetch gpu_subslice_count into a plain Python int before
-        # # torch.compile starts tracing.  Without this, Dynamo would try to
-        # # evaluate torch.xpu.get_device_properties() symbolically and fail
-        # # because _XpuDeviceProperties is not a supported ConstantVariable type.
-        # prefetch_sm_count(torch.device("xpu", model_runner.gpu_id))
+        self._apply_xpu_compile_config()
+        self._register_xpu_device_properties_for_dynamo()
         super().__init__(model_runner)
 
         assert (
