@@ -67,7 +67,10 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     recomputed at replay outside the compiled callable's sub-graphs.
     """
 
-    def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
+    def __init__(
+        self,
+        cuda_graph_runner: BaseCudaGraphRunner,
+    ) -> None:
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
@@ -126,6 +129,11 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             graph_pool=graph_pool,
         )
 
+    def _set_graph_pool_id(self) -> None:
+        if self._pool is None:
+            self._pool = self._device_module.graph_pool_handle()
+        set_graph_pool_id(self._pool)
+
     def _run_compile_pass(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         """JIT-activate kernels at the smallest shape, install
         torch.compile, then run one forward per shape inside
@@ -144,9 +152,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     num_tokens=cuda_graph_runner.capture_num_tokens[0]
                 )
 
-                if self._pool is None:
-                    self._pool = self._device_module.graph_pool_handle()
-                set_graph_pool_id(self._pool)
+                self._set_graph_pool_id()
 
                 self.install_compile(
                     language_model.model,

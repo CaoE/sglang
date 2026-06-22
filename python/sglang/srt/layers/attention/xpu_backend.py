@@ -602,6 +602,14 @@ class XPUAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
+                out=(
+                    forward_batch._attn_output.view(
+                        -1, layer.tp_q_head_num, layer.v_head_dim
+                    )
+                    if not use_cascade_attn
+                    and getattr(forward_batch, "_attn_output", None) is not None
+                    else None
+                ),
                 **kwargs,
             )
 
