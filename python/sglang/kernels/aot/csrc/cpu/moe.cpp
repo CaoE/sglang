@@ -962,7 +962,7 @@ at::Tensor fused_experts_cpu(
   // check scales
   check_moe_scales(moe_comp_method, w1_scale, w2_scale, block_size);
 
-  at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states).to(at::kBFloat16);
+  at::Tensor out_hidden_states = inplace ? hidden_states : at::empty(hidden_states.sizes(), hidden_states.options().dtype(at::kBFloat16));
 
   // NB: worst case is each expert holds a block with remainder of 1
   //   1. sorted_ids : [M * topk + E * (BLOCK_M - 1)]

@@ -789,7 +789,7 @@ std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(co
   int64_t num_channels = t_bf16.size(0);
   int64_t elements_per_channel = t_bf16.numel() / num_channels;
   assert(elements_per_channel % 32 == 0);  // do not consider tile currently
-  at::Tensor quant_t = at::empty_like(t_bf16).to(at::kFloat8_e4m3fn);
+  at::Tensor quant_t = at::empty(t_bf16.sizes(), t_bf16.options().dtype(at::kFloat8_e4m3fn));
 
   // Allocate output tensors
   at::Tensor scale_tensor = at::empty({num_channels}, t_bf16.options().dtype(at::ScalarType::Float));
@@ -894,7 +894,7 @@ _quantize_fp8e4m3_bf16_per_tensor_with_scale(const at::Tensor& t, at::Tensor& sc
 
   // Apply scale and clamp using AVX512
   const at::BFloat16* src_data = t_bf16.data_ptr<at::BFloat16>();
-  at::Tensor quant_t = at::empty_like(t_bf16).to(at::kFloat8_e4m3fn);
+  at::Tensor quant_t = at::empty(t_bf16.sizes(), t_bf16.options().dtype(at::kFloat8_e4m3fn));
   int64_t total_elements = t_bf16.numel();
   const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
   const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
