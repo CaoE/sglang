@@ -310,7 +310,6 @@ void _float8_linear_impl(
   int64_t N = Nc * block_n;
   TORCH_CHECK(K == Kc * block_k, "Float8 linear: weight and input shapes mismatch");
   auto [parallel_on_M, block_m, Mc, Mc_parallel] = get_m_blocking(M);
-  int64_t num_parallel_blocks = Mc_parallel * Nc;
 
   // scales shape = [Nc, G, block_n]
   int64_t num_groups = wei_quant_mode == PER_TENSOR ? 1 : weight_scales.size(1);
@@ -344,13 +343,13 @@ void _float8_linear_impl(
   at::Tensor micro_gemm_buffer = at::empty({num_thread, buffer_size}, output.options().dtype(at::kBFloat16));
 #endif
 
-  at::parallel_for(0, num_parallel_blocks, 1, [&](int64_t begin, int64_t end) {
-    // Get the address of pre-allocated buffers
-    float* y_buf = y_buffer.data_ptr<float>() + at::get_thread_num() * block_size;
+  parallel_2d(Mc, Nc, [&](int64_t mc0, int64_t mc1, int64_t nc0, int64_t nc1) {
+    int tid = get_thread_num();
+    float* y_buf = y_buffer.data_ptr<float>() + tid * block_size;
     at::BFloat16 *dqA_buffer = nullptr, *dqB_buffer = nullptr;
     float* ukernel_buf = nullptr;
 #if defined(CPU_CAPABILITY_AVX512)
-    at::BFloat16* micro_gemm_buf = micro_gemm_buffer.data_ptr<at::BFloat16>() + at::get_thread_num() * buffer_size;
+    at::BFloat16* micro_gemm_buf = micro_gemm_buffer.data_ptr<at::BFloat16>() + tid * buffer_size;
     ukernel_buf = reinterpret_cast<float*>(micro_gemm_buf);
 #ifndef CPUBLAS_BRGEMM_F8F8F32
     dqA_buffer = micro_gemm_buf;
@@ -358,46 +357,39 @@ void _float8_linear_impl(
     ukernel_buf = reinterpret_cast<float*>(micro_gemm_buf + block_m * block_k + block_k * block_n);
 #endif
 #endif
-    int64_t mc = 0, nc = 0;
-    data_index_init(begin, mc, Mc_parallel, nc, Nc);
-    for (const auto i : c10::irange(begin, end)) {
-      (void)i;  // Suppress unused variable
-      int64_t mc_end = parallel_on_M ? mc + 1 : Mc;
 
-      for (int mci = mc; mci < mc_end; ++mci) {
-        int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
-        zero_buffer(y_buf, m_size * block_n);
-        for (int kci = 0; kci < Kc; ++kci) {
-          auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
-          auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
-          _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
-              /* C */ y_buf,
-              /* A */ a_ptr + mci * block_m * K + kci * block_k,
-              /* scales_a */ scales_a,
-              /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
-              /* scales_b */ scales_b,
-              /* M */ m_size,
-              /* K */ block_k,
-              /* lda */ K,
-              /* ldc */ block_n,
-              /* ldsa */ ldsa,
-              /* ukernel_buf */ ukernel_buf,
-              /* dqA_buf */ dqA_buffer,
-              /* dqB_buf */ dqB_buffer);
-        }
-        // store y_buf to output with dtype conversion
-        auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr
-                        : act_quant_mode == PER_ROW  ? a_scales_ptr + mci * block_m
-                                                     : nullptr;
-        auto scales_b = wei_quant_mode == PER_TENSOR ? b_scales_ptr
-                        : wei_quant_mode == PER_ROW  ? b_scales_ptr + nc * block_n
-                                                     : nullptr;
-        auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
-        store_out<out_dtype, block_n, act_quant_mode, wei_quant_mode>(
-            y_buf, c_ptr + mci * block_m * N + nc * block_n, m_size, N /*lda*/, scales_a, scales_b, bias_data);
+    loop_2d<at::Float8_e4m3fn>(mc0, mc1, nc0, nc1, block_n * K, [&](int64_t mci, int64_t nc, int64_t) {
+      int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
+      zero_buffer(y_buf, m_size * block_n);
+      for (int kci = 0; kci < Kc; ++kci) {
+        auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
+        auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
+        _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
+            /* C */ y_buf,
+            /* A */ a_ptr + mci * block_m * K + kci * block_k,
+            /* scales_a */ scales_a,
+            /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
+            /* scales_b */ scales_b,
+            /* M */ m_size,
+            /* K */ block_k,
+            /* lda */ K,
+            /* ldc */ block_n,
+            /* ldsa */ ldsa,
+            /* ukernel_buf */ ukernel_buf,
+            /* dqA_buf */ dqA_buffer,
+            /* dqB_buf */ dqB_buffer);
       }
-      data_index_step(mc, Mc_parallel, nc, Nc);
-    }
+      auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr
+                      : act_quant_mode == PER_ROW  ? a_scales_ptr + mci * block_m
+                                                   : nullptr;
+      auto scales_b = wei_quant_mode == PER_TENSOR ? b_scales_ptr
+                      : wei_quant_mode == PER_ROW  ? b_scales_ptr + nc * block_n
+                                                   : nullptr;
+      auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
+      store_out<out_dtype, block_n, act_quant_mode, wei_quant_mode>(
+          y_buf, c_ptr + mci * block_m * N + nc * block_n, m_size, N /*lda*/, scales_a, scales_b, bias_data);
+    });
+
     if constexpr (cpublas_can_pack) {
       at::native::cpublas::brgemm_release();
     }
