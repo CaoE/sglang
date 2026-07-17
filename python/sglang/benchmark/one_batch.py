@@ -1081,4 +1081,20 @@ def cli_main():
 
 
 if __name__ == "__main__":
-    cli_main()
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    BenchArgs.add_cli_args(parser)
+    args = parser.parse_args()
+    server_args = ServerArgs.from_cli_args(args)
+    bench_args = BenchArgs.from_cli_args(args)
+
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format="%(message)s",
+    )
+
+    try:
+        main(server_args, bench_args)
+    finally:
+        if server_args.tp_size != 1:
+            kill_process_tree(os.getpid(), include_parent=False)
