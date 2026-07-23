@@ -18,6 +18,7 @@ from sglang.jit_kernel.diffusion.qknorm_rope import (
 from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.kernels.jit.utils import cache_once
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -956,6 +957,20 @@ def apply_qk_norm_with_optional_rope(
     )
 
 
+@cache_once
+def _xpu_fused_qk_norm_rope_supported(head_dim: int, rope_dim: int) -> bool:
+    """Static (shape-only) admission check for the XPU fused QK-norm+RoPE kernel.
+
+    Cached so the constant per-config checks run once; the per-call gate only adds
+    the runtime tensor checks (dtype, last-dim contiguity).
+    """
+    return (
+        head_dim in (64, 128, 256)
+        and rope_dim in (32, 64, 128, 256)
+        and rope_dim % (head_dim // 32) == 0
+    )
+
+
 def apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1048,6 +1063,10 @@ def apply_qk_norm_rope(
         )
         return q, k
 
+    # Static shape checks are cached in the helper; the gate adds only the runtime
+    # tensor checks. The fused kernel reads token/head strides directly and needs
+    # only the last dim (head_dim) contiguous, so a chunked/strided view (e.g. from
+    # `qkv.chunk(...)`) still takes the fused path; anything else falls back below.
     if (
         _is_xpu
         and allow_inplace
@@ -1056,15 +1075,7 @@ def apply_qk_norm_rope(
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
         and q.shape[-1] == head_dim
-        and q_norm.weight.shape[0] == head_dim
-        and k_norm.weight.shape[0] == head_dim
-        and head_dim in (64, 128, 256)
-        and rope_dim in (32, 64, 128, 256)
-        and rope_dim % (head_dim // 32) == 0
-        # The fused kernel reads token/head strides directly and only needs the last
-        # dim (head_dim) contiguous, so a chunked/strided view (e.g. from `qkv.chunk(...)`)
-        # goes through the fused path with no model-side copy; a head-dim-strided q/k
-        # falls back to the native path below.
+        and _xpu_fused_qk_norm_rope_supported(head_dim, rope_dim)
         and q.stride(-1) == 1
         and k.stride(-1) == 1
     ):
