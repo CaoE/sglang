@@ -12,6 +12,8 @@ namespace {
 //   * fuse format pack with elemwise OP as much as possible.
 //   * update state (FP32) with amx-bf16 where C(FP32) += A(BF16) * B(BF16)
 //   * compile time mask out upper triangular part in decay mask and tril solve, reduce fma needed.
+//   * [Precision] state readout (steps 2.a, 3.b) uses FP32 brgemm to avoid FP32->BF16 state truncation
+//     that accumulates per-layer precision loss; step 5.3 (state update) retains BF16 brgemm for performance.
 
 // * convert to vnni format， expect contiguous input and output
 //     from [K/2, 2, N] FP32 to [K/2, N, 2] BF16
@@ -67,6 +69,40 @@ void pack_vnni2(scalar_t* __restrict__ dst, float* __restrict__ src, const float
     }
   }
 #endif
+}
+
+// Scale FP32 state matrix in-place: src[K, N] *= exp(g_last)
+// Used instead of pack_vnni2 when we want to keep state in FP32 for readout precision.
+template <int K, int N>
+void scale_fp32_state(float* __restrict__ src, const float g_last, int ld_src) {
+  const float scale = std::exp(g_last);
+#if defined(CPU_CAPABILITY_AVX512)
+  const __m512 vscale = _mm512_set1_ps(scale);
+  constexpr int NB = N / 16;
+  for (int k = 0; k < K; k++) {
+    auto apply_row = [&](auto nb) {
+      __m512 v = _mm512_loadu_ps(src + k * ld_src + nb * 16);
+      _mm512_storeu_ps(src + k * ld_src + nb * 16, _mm512_mul_ps(v, vscale));
+    };
+    Unroll<NB>{}(apply_row);
+  }
+#else
+  for (int k = 0; k < K; k++) {
+    for (int n = 0; n < N; n++) {
+      src[k * ld_src + n] *= scale;
+    }
+  }
+#endif
+}
+
+// Convert a 2-D reduced-float matrix (BF16 or FP16) to FP32 row-by-row.
+// src[M, ld_src] (scalar_t)  ->  dst[M, ld_dst] (FP32)
+template <typename scalar_t, int N>
+void convert_reduced_to_fp32_2d(
+    float* __restrict__ dst, const scalar_t* __restrict__ src, int M, int ld_src, int ld_dst) {
+  for (int m = 0; m < M; m++) {
+    at::vec::convert<scalar_t, float>(src + m * ld_src, dst + m * ld_dst, N);
+  }
 }
 
 template <typename scalar_t, int SIZE>
@@ -916,15 +952,14 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
 
     // thread local temp buffer
     DECL_ZERO_BUF(scalar_t, tmp, CHUNK_SIZE * D);
-    DECL_ZERO_BUF(scalar_t, tmp2, D * D);
     DECL_ZERO_BUF(float, tmp3, CHUNK_SIZE* D);
     DECL_ZERO_BUF(scalar_t, tmp4, CHUNK_SIZE * D);
+    DECL_ZERO_BUF(float, fp32_conv_buf, CHUNK_SIZE* D);
     DECL_ZERO_BUF(float, attn, CHUNK_SIZE* CHUNK_SIZE);
     DECL_ZERO_BUF(scalar_t, attn2, CHUNK_SIZE * CHUNK_SIZE);
 
     // alias
     scalar_t* __restrict__ k_packed = tmp;
-    scalar_t* __restrict__ s_packed = tmp2;
     float* __restrict__ v_prime = tmp3;
     scalar_t* __restrict__ v_prime2 = tmp;
     float* __restrict__ attn_inter = tmp3;
@@ -972,28 +1007,27 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
         const float* __restrict__ d_ptr = d + nt * (Hv * CHUNK_SIZE * CHUNK_SIZE) + hv * (CHUNK_SIZE * CHUNK_SIZE);
         apply_mask_kernel<scalar_t, CHUNK_SIZE, false>::apply(attn2, attn, nullptr, d_ptr, mb_size);
 
-        // step 2.a: v' = w @ state (fuse state *= exp(g_last) with packing)
+        // step 2.a: v' = w @ state (fuse state *= exp(g_last) with scaling)
+        // [Precision fix] Scale state in FP32 before readout, then keep the readout
+        // brgemm in FP32 to avoid compounding BF16 truncation of accumulated state.
         float* __restrict__ s_ptr = state + indices[bs] * (Hv * D * D) + hv * (D * D);
         const float* __restrict__ g_ptr = g + nt * (Hv * CHUNK_SIZE) + hv * (CHUNK_SIZE);
         float g_last = g_ptr[mb_size - 1];
-        pack_vnni2<scalar_t, D, D>(
-            /*    dst */ s_packed,
-            /*    src */ s_ptr,
-            /* g_last */ g_last,
-            /* ld_src */ D,
-            /* ld_dst */ D);
+        scale_fp32_state<D, D>(s_ptr, g_last, D);
 
         const scalar_t* __restrict__ w_ptr = w + (batch_offset + mb_start) * w_strideT + hv * w_strideH;
+        // Convert BF16 w to FP32 in fp32_conv_buf, then use FP32 brgemm with FP32 state
+        convert_reduced_to_fp32_2d<scalar_t, D>(fp32_conv_buf, w_ptr, mb_size, w_strideT, D);
         at::native::cpublas::brgemm(
             /*     M */ mb_size,
             /*     N */ D,
             /*     K */ D,
-            /*   lda */ w_strideT,
+            /*   lda */ D,
             /*   ldb */ D,
             /*   ldc */ D,
             /* add_C */ false,
-            /*     A */ w_ptr,
-            /*     B */ s_packed,
+            /*     A */ fp32_conv_buf,
+            /*     B */ s_ptr,
             /*     C */ v_prime);
 
         // step 2.b: v2' = u - v'
@@ -1005,6 +1039,8 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
             qg_exp, q_ptr, nullptr, g_ptr, mb_size, q_strideT, D, /*b_stride*/ 0);
 
         // step 3.b: attn_inter = qg_exp @ state
+        // [Precision fix] Convert BF16 qg_exp to FP32, then FP32 brgemm with FP32 state
+        convert_reduced_to_fp32_2d<scalar_t, D>(fp32_conv_buf, qg_exp, mb_size, D, D);
         at::native::cpublas::brgemm(
             /*     M */ mb_size,
             /*     N */ D,
@@ -1013,8 +1049,8 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
             /*   ldb */ D,
             /*   ldc */ D,
             /* add_C */ false,
-            /*     A */ qg_exp,
-            /*     B */ s_packed,
+            /*     A */ fp32_conv_buf,
+            /*     B */ s_ptr,
             /*     C */ attn_inter);
 
         // step 4.a: attn_inter += attn2 @ v2'
