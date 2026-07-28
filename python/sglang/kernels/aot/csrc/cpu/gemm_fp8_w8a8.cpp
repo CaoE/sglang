@@ -704,11 +704,6 @@ _quantize_fp8e4m3(const at::Tensor& t, bool channelwise, c10::optional<at::Tenso
 }
 
 inline __m128i cvtfp32_fp8e4m3(__m512& src) {
-#ifdef __AVX10_2__
-  __m256i f16_vec =
-      _mm512_cvt_roundps_ph(src, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-  return _mm256_cvtph_hf8(_mm256_castsi256_ph(f16_vec));
-#else
   // cvt 16x32 from fp32 to fp8 e4m3
   const __m512i sign_mask = _mm512_set1_epi32(0x80000000);
   const __m512i fp8_max = _mm512_set1_epi32(UINT32_C(1087) << 20);
@@ -768,7 +763,49 @@ inline __m128i cvtfp32_fp8e4m3(__m512& src) {
 
   // Narrow 32-bit integers to 8-bit
   return _mm512_cvtepi32_epi8(packed);
-#endif
+}
+
+__attribute__((target("avx10.2"))) inline __m128i cvtfp32_fp8e4m3_avx10_2(__m512& src) {
+  __m256i f16_vec = _mm512_cvt_roundps_ph(src, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  return _mm256_cvtph_hf8(_mm256_castsi256_ph(f16_vec));
+}
+
+bool avx10_2_available() {
+  // __builtin_cpu_supports returns the masked feature bit rather than 0/1.
+  static const bool available = __builtin_cpu_supports("avx10.2");
+  return available;
+}
+
+// Carries the whole loop rather than just the conversion as GCC cannot inline avx10.2 function
+// into a caller lacking that target, so branching per vector is costly.
+__attribute__((target("avx10.2"))) void quantize_bf16_block_avx10_2(
+    const at::BFloat16* __restrict__ src,
+    at::Float8_e4m3fn* __restrict__ dst,
+    int64_t count,
+    float scale_reciprocal) {
+  constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
+  const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
+  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+  const __m512 neg_quant_max_vec = _mm512_set1_ps(-quant_max);
+
+  for (int64_t i = 0; i <= count - 32; i += 32) {
+    __m256i src_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&src[i]));
+    __m256i src_vec2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&src[i + 16]));
+
+    __m512 fp32_vec1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec1), 16));
+    __m512 fp32_vec2 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec2), 16));
+
+    __m512 scaled_vec1 = _mm512_mul_ps(fp32_vec1, scale_recip_vec);
+    __m512 clamped_vec1 = _mm512_min_ps(_mm512_max_ps(scaled_vec1, neg_quant_max_vec), quant_max_vec);
+
+    __m512 scaled_vec2 = _mm512_mul_ps(fp32_vec2, scale_recip_vec);
+    __m512 clamped_vec2 = _mm512_min_ps(_mm512_max_ps(scaled_vec2, neg_quant_max_vec), quant_max_vec);
+
+    __m128i fp8_vec1 = cvtfp32_fp8e4m3_avx10_2(clamped_vec1);
+    __m128i fp8_vec2 = cvtfp32_fp8e4m3_avx10_2(clamped_vec2);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), fp8_vec1);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i + 16), fp8_vec2);
+  }
 }
 
 std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(const at::Tensor& t) {
@@ -826,6 +863,10 @@ std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(co
       scale_data[c] = scale_val;
 
       // Step 3: Scale and clamp using AVX512 (reuse the same loop structure)
+      if (avx10_2_available()) {
+        quantize_bf16_block_avx10_2(channel_src, quant_dst, elements_per_channel, scale_reciprocal);
+        continue;
+      }
       i = 0;
       const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
       const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
@@ -899,6 +940,11 @@ _quantize_fp8e4m3_bf16_per_tensor_with_scale(const at::Tensor& t, at::Tensor& sc
     for (int64_t c = start; c < end; ++c) {
       const at::BFloat16* src_data = t_bf16.data_ptr<at::BFloat16>() + c * elements_per_channel;
       at::Float8_e4m3fn* quant_t_data = quant_t.data_ptr<at::Float8_e4m3fn>() + c * elements_per_channel;
+
+      if (avx10_2_available()) {
+        quantize_bf16_block_avx10_2(src_data, quant_t_data, elements_per_channel, scale_reciprocal);
+        continue;
+      }
 
       int64_t i = 0;
       // Process 32 elements at a time using AVX512
