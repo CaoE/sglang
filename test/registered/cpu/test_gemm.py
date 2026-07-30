@@ -71,6 +71,32 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
+    @parametrize(M=[1, 4, 5, 101], N=[16, 32 * 13], K=[32 * 16], has_bias=[False, True])
+    def test_fp16_gemm(self, M, N, K, has_bias):
+        # M <= 4 takes the AVX10.2 tinygemm, above it brgemm
+        mat1 = torch.randn(M, K, dtype=torch.float16)
+        mat2 = torch.randn(N, K, dtype=torch.float16)
+
+        ref = torch.matmul(mat1.float(), mat2.float().t())
+        if has_bias:
+            bias = torch.randn(N, dtype=torch.float32)
+            ref.add_(bias.half())
+
+        ref = ref.half()
+
+        out = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, mat2, bias if has_bias else None, False
+        )
+
+        packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
+        out2 = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, packed_mat2, bias if has_bias else None, True
+        )
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
+
     @parametrize(
         M=[1, 8, 32, 1024],
         N=[12, 1],

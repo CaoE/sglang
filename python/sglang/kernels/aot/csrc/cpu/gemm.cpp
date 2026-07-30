@@ -276,6 +276,69 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
     Unroll<ROWS * COLS>{}(storec);
   }
 };
+
+#if defined(__AVX10_2__)
+template <bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::Half, has_bias, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::Half* __restrict__ A,
+      const at::Half* __restrict__ B,
+      at::Half* __restrict__ C,
+      const float* __restrict__ bias,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N / 16;
+
+    __m512h va;
+    __m512h vb[COLS];
+    __m512 vc[ROWS * COLS];
+
+    auto loadc = [&](auto i) {
+      constexpr int col = i % COLS;
+      if constexpr (has_bias) {
+        vc[i] = _mm512_loadu_ps(bias + col * 16);
+      } else {
+        vc[i] = _mm512_set1_ps(0.f);
+      }
+    };
+    Unroll<ROWS * COLS>{}(loadc);
+
+    const int64_t K2 = K >> 1;
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const float* b_ptr = reinterpret_cast<const float*>(B);
+
+    auto compute = [&](auto i, int64_t k) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+
+      if constexpr (col == 0) {
+        va = _mm512_castps_ph(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+      }
+      if constexpr (row == 0) {
+        vb[col] = _mm512_castsi512_ph(_mm512_loadu_si512(b_ptr + k * ldb2 + col * 16));
+      }
+      vc[i] = _mm512_dpph_ps(vc[i], va, vb[col]);
+    };
+    for (int64_t k = 0; k < K2; ++k) {
+      Unroll<ROWS * COLS>{}(compute, k);
+    }
+
+    // per-column 256bit store; the paired cvtx2ps_ph form buys nothing here
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      _mm256_storeu_si256(
+          reinterpret_cast<__m256i*>(C + row * ldc + col * 16), _mm256_castph_si256(_mm512_cvtxps_ph(vc[i])));
+    };
+    Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif  // __AVX10_2__
 #endif
 
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                \
@@ -461,7 +524,13 @@ void weight_packed_linear_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
+  // local override: can_use_brgemm<at::Half> has to keep returning true for the
+  // moe.cpp and bmm.cpp callers, whose tinygemm has no fp16 variant
+#if defined(CPU_CAPABILITY_AVX512) && defined(__AVX10_2__)
+  const bool use_brgemm = std::is_same_v<scalar_t, at::Half> ? M > 4 : can_use_brgemm<scalar_t>(M);
+#else
   const bool use_brgemm = can_use_brgemm<scalar_t>(M);
+#endif
 
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
