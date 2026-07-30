@@ -27,6 +27,7 @@ import torch
 import tqdm
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -687,6 +688,10 @@ class CPUGraphRunner:
         self.graphs_cross = {}
         self.output_buffers = {}
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
+        self.skip_guard_eval_on_replay = (
+            self.enable_torch_compile
+            and envs.SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE.get()
+        )
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -1064,11 +1069,18 @@ class CPUGraphRunner:
         with replay_context():
             with skip_ctx:
                 prepared_forward_batch = self.prepare_replay(forward_batch, skip=skip)
-                output = graphs[prepared_forward_batch.batch_size](
-                    prepared_forward_batch.input_ids,
-                    prepared_forward_batch.positions,
-                    prepared_forward_batch,
+                # scoped to this call: prefill compiles helpers with new shapes
+                skip_guard_context = (
+                    torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+                    if self.skip_guard_eval_on_replay
+                    else empty_context()
                 )
+                with skip_guard_context:
+                    output = graphs[prepared_forward_batch.batch_size](
+                        prepared_forward_batch.input_ids,
+                        prepared_forward_batch.positions,
+                        prepared_forward_batch,
+                    )
         if forward_batch.batch_size in graphs:
             return output
 

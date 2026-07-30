@@ -939,6 +939,8 @@ class Envs:
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
+    # Skip dynamo guard re-evaluation when replaying a captured CPU decode graph
+    SGLANG_ENABLE_SKIP_GUARD_EVAL_UNSAFE = EnvBool(False)
 
     # ===================================================================
     # Expert parallel load balancing
