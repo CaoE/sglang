@@ -506,6 +506,14 @@ void zero_buffer(T* data, int64_t size) {
 }
 #endif
 
+#if defined(__x86_64__)
+bool avx10_2_available() {
+  // __builtin_cpu_supports returns the masked feature bit rather than 0/1.
+  static const bool available = __builtin_cpu_supports("avx10.2");
+  return available;
+}
+#endif
+
 template <typename T>
 struct vnni_traits;
 template <>

@@ -277,7 +277,9 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
   }
 };
 
-#if defined(__AVX10_2__)
+// The intrinsics need AVX10.2; runtime dispatch prevents running this kernel on a non-AVX10.2 machine.
+#pragma GCC push_options
+#pragma GCC target("avx10.2")
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::Half, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -338,7 +340,7 @@ struct tinygemm_kernel_nn<at::Half, has_bias, BLOCK_M, BLOCK_N> {
     Unroll<ROWS * COLS>{}(storec);
   }
 };
-#endif  // __AVX10_2__
+#pragma GCC pop_options
 #endif
 
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                \
@@ -526,8 +528,9 @@ void weight_packed_linear_kernel_impl(
 
   // local override: can_use_brgemm<at::Half> has to keep returning true for the
   // moe.cpp and bmm.cpp callers, whose tinygemm has no fp16 variant
-#if defined(CPU_CAPABILITY_AVX512) && defined(__AVX10_2__)
-  const bool use_brgemm = std::is_same_v<scalar_t, at::Half> ? M > 4 : can_use_brgemm<scalar_t>(M);
+#if defined(CPU_CAPABILITY_AVX512)
+  const bool use_brgemm =
+      (std::is_same_v<scalar_t, at::Half> && avx10_2_available()) ? M > 4 : can_use_brgemm<scalar_t>(M);
 #else
   const bool use_brgemm = can_use_brgemm<scalar_t>(M);
 #endif

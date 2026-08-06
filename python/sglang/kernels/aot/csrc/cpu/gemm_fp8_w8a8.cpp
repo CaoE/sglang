@@ -770,12 +770,6 @@ __attribute__((target("avx10.2"))) inline __m128i cvtfp32_fp8e4m3_avx10_2(__m512
   return _mm256_cvtph_hf8(_mm256_castsi256_ph(f16_vec));
 }
 
-bool avx10_2_available() {
-  // __builtin_cpu_supports returns the masked feature bit rather than 0/1.
-  static const bool available = __builtin_cpu_supports("avx10.2");
-  return available;
-}
-
 // Carries the whole loop rather than just the conversion as GCC cannot inline avx10.2 function
 // into a caller lacking that target, so branching per vector is costly.
 __attribute__((target("avx10.2"))) void quantize_bf16_block_avx10_2(
