@@ -717,7 +717,8 @@ class C4IndexerBackendMixin:
         elif is_xpu():
             from sgl_kernel import fp8_paged_mqa_logits_triton
 
-            # TODO: switch from triton to SYCL when OOM is resolved
+            # The SYCL path materializes [query_rows, heads, max_c4_seq_len]
+            # intermediates. Use Triton until it streams paged score reduction.
 
             fn = fp8_paged_mqa_logits_triton
         else:
@@ -771,6 +772,23 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
+            logits_max_c4_seq_len = indexer_metadata.max_c4_seq_len
+            if is_xpu() and indexer_metadata.use_prefill_cuda_graph:
+                # Graph metadata retains capture-sized page tables for stable
+                # addresses. Triton's eager paged gather must use the live extent.
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                if isinstance(seq_lens_cpu, torch.Tensor):
+                    if seq_lens_cpu.device.type == "cpu":
+                        live_seq_len = int(seq_lens_cpu[: forward_batch.batch_size].max())
+                    else:
+                        live_seq_len = None
+                elif seq_lens_cpu is not None:
+                    live_seq_len = max(seq_lens_cpu[: forward_batch.batch_size])
+                else:
+                    live_seq_len = None
+                if live_seq_len is not None:
+                    logits_max_c4_seq_len = max(1, live_seq_len // 4)
+                    assert logits_max_c4_seq_len <= indexer_metadata.max_c4_seq_len
             logits = fn(
                 q,
                 c4_indexer_kv_cache,
@@ -778,7 +796,7 @@ class C4IndexerBackendMixin:
                 _c4sl,
                 page_table,
                 indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
+                logits_max_c4_seq_len,
                 False,
             )
 
