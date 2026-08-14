@@ -436,11 +436,11 @@ def prepare_extend_inputs_for_correctness_test(
 def prepare_synthetic_inputs_for_latency_test(
     batch_size, input_len, custom_inputs=None
 ):
-    input_ids = (
-        custom_inputs
-        if custom_inputs
-        else np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
-    )
+    if custom_inputs:
+        input_ids = custom_inputs
+    else:
+        np.random.seed(42)
+        input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
@@ -782,6 +782,7 @@ def latency_test_run_once(
     next_token_ids, _, batch = model_runner.extend(reqs)
     model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
+    generated_token_ids = [next_token_ids.tolist()]
 
     if enable_profile_prefill:
         stop_profile(
@@ -828,6 +829,7 @@ def latency_test_run_once(
         next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         model_runner.synchronize()
         latency = time.perf_counter() - tic
+        generated_token_ids.append(next_token_ids.tolist())
 
         # Stop profiler after the specified number of steps
         if enable_profile_decode and profiler is not None and i >= profile_end - 1:
@@ -865,6 +867,8 @@ def latency_test_run_once(
     )
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
+
+    rank_print(f"\n[Calculation Result] Generated Output Token IDs: {generated_token_ids}\n")
 
     model_runner.cleanup(batch)
     return measurement_results
