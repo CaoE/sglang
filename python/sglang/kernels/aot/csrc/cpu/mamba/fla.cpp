@@ -1565,7 +1565,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_inter(
 //   initial_state: [num_seqs, Hv, Dv, D] FP32
 //   cu_seqlens: [num_seqs + 1] INT32
 //
-std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+at::Tensor chunk_gated_delta_rule_cpu(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
@@ -1617,7 +1617,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
       chunk_gated_delta_rule_fwd_intra<CHUNK_SIZE>(key_, value, g_, beta, cu_seqlens, chunk_indices);
 
   // fused `chunk_gated_delta_rule_fwd_h` + `chunk_fwd_o`
-  auto [output, final_state] = chunk_gated_delta_rule_fwd_inter<CHUNK_SIZE>(
+  auto output_and_state = chunk_gated_delta_rule_fwd_inter<CHUNK_SIZE>(
       query_,
       key_,
       w,
@@ -1630,7 +1630,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
       chunk_offsets,
       initial_state_indices);
 
-  return std::make_tuple(output, final_state);
+  return std::get<0>(output_and_state);
 }
 
 // A_log: [v_num_heads]

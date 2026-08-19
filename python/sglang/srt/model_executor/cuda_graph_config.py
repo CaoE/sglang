@@ -52,10 +52,10 @@ ALLOWED_BACKENDS_PER_PHASE = {
         Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
-    # full for prefill captures one whole-forward graph per num_tokens
+    # On CPU, full prefill captures one whole-forward graph per num_tokens
     # bucket with a fixed request-slot count; replay pads num_tokens up to
-    # the nearest captured bucket. Opt-in: the padding waste is the
-    # operator's call.
+    # the nearest captured bucket. On CUDA, the prefill default remains the
+    # platform-specific backend below.
     Phase.PREFILL: (
         Backend.FULL,
         Backend.BREAKABLE,
@@ -109,14 +109,16 @@ class PhaseConfig:
 
 def default_prefill_backend() -> str:
     """BCG (breakable) is the prefill default on CUDA only; other platforms
-    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. Full-graph
-    prefill capture is opt-in per model architecture via the declarative
-    registry (see _inkling_overrides in arg_groups/overrides.py), not a global
-    default. Lazy import keeps this module's stdlib-only import invariant (see
-    module docstring)."""
-    from sglang.srt.utils import is_cuda
+    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. CPU graph
+    capture uses the CPU-specific full backend. Lazy import keeps this module's
+    stdlib-only import invariant (see module docstring)."""
+    from sglang.srt.utils import is_cpu, is_cuda
 
-    return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
+    if is_cuda():
+        return Backend.BREAKABLE
+    if is_cpu():
+        return Backend.FULL
+    return Backend.TC_PIECEWISE
 
 
 @dataclass
@@ -191,6 +193,32 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     if cfg is None or phase not in Phase.ALL:
         return False
     return getattr(cfg, phase).backend == backend
+
+
+def check_cpu_graph_backend(
+    model_runner: Any,
+    phase: str,
+    *,
+    force_for_draft_worker: bool = False,
+) -> bool:
+    """Return whether a CPU graph can be captured for ``phase``."""
+    if getattr(model_runner, "device", None) != "cpu":
+        return False
+
+    from sglang.srt.runtime_context import get_flags
+
+    if not get_flags().capture.enable_torch_compile:
+        return False
+    if getattr(model_runner, "is_draft_worker", False) and not force_for_draft_worker:
+        return False
+    if check_cuda_graph_backend(phase, Backend.DISABLED):
+        return False
+    if not check_cuda_graph_backend(phase, Backend.FULL):
+        raise ValueError(f"CPU {phase} graph only supports the 'full' backend.")
+    return (
+        getattr(model_runner, "prefill_attention_backend_str", None) == "intel_amx"
+        and getattr(model_runner, "decode_attention_backend_str", None) == "intel_amx"
+    )
 
 
 def cuda_graph_fully_disabled() -> bool:

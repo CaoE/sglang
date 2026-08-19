@@ -4899,16 +4899,21 @@ class ServerArgs:
             else:
                 decode_cuda_graph_config.max_bs = max(decode_cuda_graph_config.bs)
         else:
-            # Reuse decode_cuda_graph_config.bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
-            # as cpu graph is based on torch.compile
+            # CPU graph buckets are generated from the canonical phase-level
+            # decode.max_bs. Explicit decode.bs has the highest priority;
+            # torch_compile_max_bs is kept as the lowest-priority fallback.
             if decode_cuda_graph_config.bs is not None:
                 self.torch_compile_max_bs = max(decode_cuda_graph_config.bs)
             else:
-                # If decode_cuda_graph_config.bs is not set, we will preferentially use torch_compile_max_bs
-                # to generate decode_cuda_graph_config.bs
-                self.torch_compile_max_bs = (
-                    self.torch_compile_max_bs or decode_cuda_graph_config.max_bs
-                )
+                # The generic memory defaults above are GPU-oriented. On CPU,
+                # use the phase max only when it was explicitly configured;
+                # otherwise let the legacy torch compile value provide the
+                # fallback max for the CPU graph.
+                if (Phase.DECODE, "max_bs") not in getattr(
+                    self, "_cuda_graph_config_locked", set()
+                ):
+                    decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
+                self.torch_compile_max_bs = decode_cuda_graph_config.max_bs
                 decode_cuda_graph_config.bs = self._generate_cpu_graph_batch_sizes()
 
             assert (

@@ -773,10 +773,7 @@ __attribute__((target("avx10.2"))) inline __m128i cvtfp32_fp8e4m3_avx10_2(__m512
 // Carries the whole loop rather than just the conversion as GCC cannot inline avx10.2 function
 // into a caller lacking that target, so branching per vector is costly.
 __attribute__((target("avx10.2"))) void quantize_bf16_block_avx10_2(
-    const at::BFloat16* __restrict__ src,
-    at::Float8_e4m3fn* __restrict__ dst,
-    int64_t count,
-    float scale_reciprocal) {
+    const at::BFloat16* __restrict__ src, at::Float8_e4m3fn* __restrict__ dst, int64_t count, float scale_reciprocal) {
   constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
   const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
   const __m512 quant_max_vec = _mm512_set1_ps(quant_max);

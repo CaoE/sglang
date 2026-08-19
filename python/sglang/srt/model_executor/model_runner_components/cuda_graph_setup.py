@@ -19,6 +19,7 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
+    check_cpu_graph_backend,
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -41,7 +42,6 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -176,11 +176,15 @@ def capture_cuda_graphs(
     )
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
+            decode = capture_decode_graph(
+                model_runner=model_runner, prefill_runner=prefill.runner
+            )
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
-            decode = capture_decode_graph(model_runner=model_runner)
+            decode = capture_decode_graph(
+                model_runner=model_runner, prefill_runner=prefill.runner
+            )
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -232,6 +236,16 @@ def capture_prefill_graph(
             memory_usage_gb=memory_usage_gb,
             capture_time=capture_time,
         )
+
+    # CPU graph is currently supported only by the Intel AMX attention backend.
+    if getattr(model_runner, "device", None) == "cpu":
+        if not check_cpu_graph_backend(
+            model_runner,
+            Phase.PREFILL,
+            force_for_draft_worker=force_for_draft_worker,
+        ):
+            return result(None)
+        return result(CPUGraphRunner(model_runner))
 
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
@@ -398,7 +412,9 @@ def capture_prefill_graph(
     return result(prefill_runner, mem_usage, capture_time)
 
 
-def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
+def capture_decode_graph(
+    *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
+) -> GraphCapture:
     """Capture device graphs."""
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
@@ -430,8 +446,18 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         Phase.DECODE, Backend.DISABLED
     ):
         return no_capture
-    if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
-        return no_capture
+    if model_runner.device == "cpu":
+        if not check_cpu_graph_backend(model_runner, Phase.DECODE):
+            return no_capture
+        if prefill_runner is None:
+            prefill_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
+        if isinstance(prefill_runner, CPUGraphRunner):
+            return GraphCapture(
+                runner=prefill_runner,
+                memory_phase=memory_phase,
+                memory_usage_gb=0,
+                capture_time=0,
+            )
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
