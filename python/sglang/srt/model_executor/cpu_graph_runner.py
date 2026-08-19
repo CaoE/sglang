@@ -177,6 +177,7 @@ def register_fake_ops(tp_size: int):
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "fused_sigmoid_mul_cpu",
         "multimodal_rotary_embedding_cpu",
         "apply_multidimensional_rope_cpu",
     ]
@@ -201,13 +202,6 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
-
-    # Returns Tensor(a!), an alias of input, so the fake returns input itself --
-    # a fresh tensor would contradict the alias annotation. The sole caller
-    # (qwen3_5) passes inplace=True, which is the aliasing branch.
-    @register_cpu_compile_fake("fused_sigmoid_mul_cpu")
-    def _(input, gate, inplace):
-        return input
 
     @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
     def _(q, k, *args, **kwargs):

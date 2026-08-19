@@ -159,7 +159,11 @@ if _is_cuda:
     )
 
 if _is_cpu:
-    fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+    _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+
+    def fused_sigmoid_mul(x, gate, inplace=True):
+        _fused_sigmoid_mul_cpu(x, gate)
+
     fused_qk_gemma_rmsnorm = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu
     fused_qk_gemma_rmsnorm_with_gate = (
         torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
@@ -1181,7 +1185,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             if not _is_npu:
-                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+                fused_sigmoid_mul(attn_output, gate)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output.mul_(torch.sigmoid(gate_val))
