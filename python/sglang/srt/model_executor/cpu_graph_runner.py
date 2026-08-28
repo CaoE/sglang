@@ -56,7 +56,6 @@ from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
     log_info_on_rank0,
-    require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
@@ -228,7 +227,6 @@ if TYPE_CHECKING:
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
-    num_tokens: int,
     tp_group: GroupCoordinator,
     dynamic: bool = False,
     model_forward: Optional[Callable] = None,
@@ -890,7 +888,6 @@ class CPUGraphRunner:
             if model_runner.is_draft_worker
             else get_server_return_hidden_states_mode()
         )
-        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
@@ -914,11 +911,9 @@ class CPUGraphRunner:
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -988,7 +983,6 @@ class CPUGraphRunner:
             self.captured_forward_batches_cross = {}
             # Attention backend
             self.max_bs = max(self.capture_bs)
-            self.max_num_token = self.max_bs * self.captured_req_width
             if self.enable_dynamic_graph:
                 self.dynamic_capture_bs = min(
                     self.max_bs + 1, model_runner.req_to_token_pool.size
@@ -1015,7 +1009,6 @@ class CPUGraphRunner:
             self.captured_forward_batches = {}
             self.captured_forward_batches_cross = {}
             self.max_bs = 0
-            self.max_num_token = 0
             self.encoder_len_fill_value = 0
             self.seq_len_fill_value = 0
 
@@ -1178,7 +1171,6 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 bs in self.capture_bs,
-                num_tokens=bs * self.captured_req_width,
                 tp_group=self.model_runner.tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
@@ -1396,7 +1388,6 @@ class CPUGraphRunner:
         with patch_model(
             self.model_runner.model,
             self.enable_torch_compile,
-            num_tokens=self.capture_buffer_num_token,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
         ) as forward:
@@ -1856,7 +1847,6 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
             model_forward=(
@@ -1880,7 +1870,6 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=False,
             model_forward=(
@@ -1927,7 +1916,6 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=self.prefill_max_num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
             model_forward=(
@@ -1956,7 +1944,6 @@ class CPUGraphRunner:
         with patch_model(
             self._prefill_graph_model,
             self.enable_torch_compile,
-            num_tokens=self.prefill_max_num_tokens,
             tp_group=self.model_runner.tp_group,
             dynamic=True,
             model_forward=(
