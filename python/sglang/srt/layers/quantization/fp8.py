@@ -775,6 +775,8 @@ class Fp8LinearMethod(LinearMethodBase):
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
             return
+        if self.mxfp8_dense_backend.is_torch_scaled_mm():
+            return
 
         backend = self.mxfp8_dense_backend
         if backend.is_flashinfer_trtllm():
@@ -1028,9 +1030,11 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            backend = self.mxfp8_dense_backend
             extra_kwargs = {}
-            if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
+            backend = self.mxfp8_dense_backend
+            if backend.is_torch_scaled_mm():
+                weight_scale = layer.weight_scale_inv
+            elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled

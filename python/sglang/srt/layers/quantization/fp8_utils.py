@@ -357,6 +357,7 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
+    TORCH_SCALED_MM = "torch_scaled_mm"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -376,6 +377,9 @@ class Mxfp8DenseGemmBackend(Enum):
 
     def is_gfx95_dot_scaled(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+
+    def is_torch_scaled_mm(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.TORCH_SCALED_MM
 
     def is_unsupported(self) -> bool:
         return self == Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -573,7 +577,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     return _dispatch_auto_backend()
 
 
-def torch_w8a8_block_fp8_linear(
+def torch_w8a8_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
@@ -581,42 +585,101 @@ def torch_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run block-FP8 linear with Torch's scaled_mm implementation."""
+    """Run XPU block-FP8 or MXFP8 linear with Torch's scaled_mm implementation."""
     if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
         raise ValueError(
-            f"XPU block-FP8 scaled_mm expects a two-dimensional weight_block_size, "
+            f"XPU FP8 scaled_mm expects a two-dimensional weight_block_size, "
             f"but got {block_size}"
         )
     block_n, block_k = block_size
-    if block_k != 128 or block_n not in (1, 128):
+    is_mxfp8 = block_n == 1 and block_k == 32
+    if not is_mxfp8 and (block_k != 128 or block_n not in (1, 128)):
         raise ValueError(
-            "XPU block-FP8 scaled_mm supports weight_block_size [1, 128] or "
-            f"[128, 128], but got {block_size}"
+            "XPU FP8 scaled_mm supports weight_block_size [1, 128], [128, 128], "
+            f"or [1, 32], but got {block_size}"
         )
+    if is_mxfp8 and weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"MXFP8 weight must be float8_e4m3fn, got {weight.dtype}")
+    if is_mxfp8 and (weight.ndim != 2 or weight.shape[1] % 32 != 0):
+        raise ValueError(
+            f"MXFP8 weight must be [N, K] with K divisible by 32, got {tuple(weight.shape)}"
+        )
+    if is_mxfp8:
+        if weight_scale.dtype == torch.uint8:
+            weight_scale = weight_scale.view(torch.float8_e8m0fnu)
+        if weight_scale.dtype != torch.float8_e8m0fnu:
+            raise TypeError(
+                "MXFP8 weight_scale must be uint8 or float8_e8m0fnu, "
+                f"got {weight_scale.dtype}"
+            )
+        expected_weight_scale = (weight.shape[0], weight.shape[1] // 32)
+        if weight_scale.shape != expected_weight_scale:
+            raise ValueError(
+                f"MXFP8 weight_scale must have shape {expected_weight_scale}, "
+                f"got {tuple(weight_scale.shape)}"
+            )
 
     scale_b_recipe = (
-        torch.nn.functional.ScalingType.BlockWise1x128
-        if block_n == 1
-        else torch.nn.functional.ScalingType.BlockWise128x128
+        torch.nn.functional.ScalingType.BlockWise1x32
+        if is_mxfp8
+        else (
+            torch.nn.functional.ScalingType.BlockWise1x128
+            if block_n == 1
+            else torch.nn.functional.ScalingType.BlockWise128x128
+        )
     )
     input_2d = input.reshape(-1, input.shape[-1])
     if input_scale is None:
-        q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
+        if not input_2d.is_contiguous():
+            input_2d = input_2d.contiguous()
+        if is_mxfp8:
+            q_input, activation_scale = sglang_per_token_group_quant_fp8(
+                input_2d,
+                block_k,
+                scale_ue8m0=True,
+                scale_dtype=torch.uint8,
+            )
+            activation_scale = activation_scale.view(torch.float8_e8m0fnu)
+        else:
+            q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
     else:
         q_input = input_2d
         activation_scale = input_scale.reshape(-1, input_scale.shape[-1])
+        if is_mxfp8:
+            if q_input.dtype != torch.float8_e4m3fn:
+                raise TypeError(
+                    "Pre-quantized MXFP8 input must be float8_e4m3fn, "
+                    f"got {q_input.dtype}"
+                )
+            if activation_scale.dtype == torch.uint8:
+                activation_scale = activation_scale.view(torch.float8_e8m0fnu)
+            if activation_scale.dtype != torch.float8_e8m0fnu:
+                raise TypeError(
+                    "MXFP8 input_scale must be uint8 or float8_e8m0fnu, "
+                    f"got {activation_scale.dtype}"
+                )
+
+    if is_mxfp8:
+        expected_input_scale = (input_2d.shape[0], input_2d.shape[1] // 32)
+        if activation_scale.shape != expected_input_scale:
+            raise ValueError(
+                f"MXFP8 input_scale must have shape {expected_input_scale}, "
+                f"got {tuple(activation_scale.shape)}"
+            )
 
     if q_input.stride(-1) != 1:
         q_input = q_input.contiguous()
     if weight.stride(-1) != 1:
         weight = weight.contiguous()
     weight_t = weight.t()
-    scale_b = weight_scale if block_n == 1 else weight_scale.t()
+    scale_b = weight_scale.t() if is_mxfp8 or block_n == 128 else weight_scale
     output = torch.nn.functional.scaled_mm(
         q_input,
         weight_t,
         activation_scale,
-        torch.nn.functional.ScalingType.BlockWise1x128,
+        torch.nn.functional.ScalingType.BlockWise1x32
+        if is_mxfp8
+        else torch.nn.functional.ScalingType.BlockWise1x128,
         scale_b,
         scale_b_recipe,
         bias=bias,
@@ -629,7 +692,6 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     """Pick the MXFP8 dense linear backend, honoring `--fp8-gemm-backend` only when it
     names a backend that owns an MXFP8 dense kernel."""
     backend = get_fp8_gemm_runner_backend()
-
     if backend.is_flashinfer_trtllm():
         if not (get_platform().is_sm100 and is_flashinfer_available()):
             raise RuntimeError(
@@ -680,6 +742,9 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return Mxfp8DenseGemmBackend.DEEP_GEMM
 
+    if _is_xpu:
+        return Mxfp8DenseGemmBackend.TORCH_SCALED_MM
+
     return Mxfp8DenseGemmBackend.UNSUPPORTED
 
 
@@ -701,6 +766,8 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
+    elif backend.is_torch_scaled_mm():
+        return partial(torch_w8a8_fp8_linear, block_size=[1, 32])
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
@@ -855,7 +922,7 @@ def _dispatch_auto_backend() -> Callable:
 
         return npu_w8a8_mxfp8_linear
     elif _is_xpu:
-        return torch_w8a8_block_fp8_linear
+        return torch_w8a8_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 

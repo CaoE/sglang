@@ -15,14 +15,18 @@ import torch
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     dispatch_w8a8_block_fp8_linear,
+    dispatch_w8a8_mxfp8_linear,
     per_token_group_quant_fp8,
-    torch_w8a8_block_fp8_linear,
+    sglang_per_token_group_quant_fp8,
+    torch_w8a8_fp8_linear,
     use_rowwise_torch_scaled_mm,
 )
+
+torch_w8a8_block_fp8_linear = torch_w8a8_fp8_linear
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
 
 
 def reference_block_fp8_matmul(
@@ -59,6 +63,29 @@ def reference_block_fp8_matmul(
     return output
 
 
+def reference_mxfp8_matmul(
+    q_input: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor = None,
+) -> torch.Tensor:
+    M, K = q_input.shape
+    block_k = 32
+    input_scale_f = input_scale.float().reshape(M, K // block_k)
+    weight_scale_f = weight_scale.float().reshape(weight.shape[0], K // block_k)
+    a_dequant = q_input.float() * input_scale_f.unsqueeze(-1).expand(
+        M, K // block_k, block_k
+    ).reshape(M, K)
+    b_dequant = weight.float() * weight_scale_f.unsqueeze(-1).expand(
+        weight.shape[0], K // block_k, block_k
+    ).reshape(weight.shape[0], K)
+    output = torch.matmul(a_dequant, b_dequant.t())
+    if bias is not None:
+        output = output + bias.float()
+    return output
+
+
 class TestXPUFP8Linear(CustomTestCase):
     def setUp(self):
         if not torch.xpu.is_available():
@@ -69,6 +96,95 @@ class TestXPUFP8Linear(CustomTestCase):
         """Verify that dispatch_w8a8_block_fp8_linear cleanly routes to torch_w8a8_block_fp8_linear on XPU."""
         dispatched_fn = dispatch_w8a8_block_fp8_linear()
         self.assertIs(dispatched_fn, torch_w8a8_block_fp8_linear)
+
+    def test_w8a8_mxfp8_dispatch_on_xpu(self):
+        dispatched_fn = dispatch_w8a8_mxfp8_linear()
+        self.assertIs(dispatched_fn.func, torch_w8a8_fp8_linear)
+        self.assertEqual(dispatched_fn.keywords["block_size"], [1, 32])
+
+    def test_torch_w8a8_mxfp8_linear_rejects_invalid_scale(self):
+        x = torch.randn(8, 256, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(384, 256, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        with self.assertRaises(TypeError):
+            torch_w8a8_fp8_linear(
+                x,
+                weight,
+                [1, 32],
+                torch.ones(384, 8, dtype=torch.float32, device=self.device),
+            )
+
+    def test_torch_w8a8_mxfp8_linear_shapes_and_accuracy(self):
+        M, K, N = 8, 256, 384
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale_u8 = (
+            torch.arange(N * (K // 32), dtype=torch.int16, device=self.device)
+            .remainder(8)
+            .add(120)
+            .to(torch.uint8)
+            .reshape(N, K // 32)
+        )
+        try:
+            bias = torch.randn(N, dtype=torch.bfloat16, device=self.device)
+            out = torch_w8a8_fp8_linear(x, weight, [1, 32], weight_scale_u8, bias=bias)
+        except (RuntimeError, ValueError) as error:
+            if "Invalid scaling configuration" in str(error):
+                self.skipTest(f"PyTorch XPU MXFP8 scaled_mm is unavailable: {error}")
+            raise
+
+        q_input, input_scale = sglang_per_token_group_quant_fp8(
+            x, 32, scale_ue8m0=True, scale_dtype=torch.uint8
+        )
+        input_scale = input_scale.view(torch.float8_e8m0fnu)
+        weight_scale = weight_scale_u8.view(torch.float8_e8m0fnu)
+        reference = reference_mxfp8_matmul(
+            q_input, input_scale, weight, weight_scale, bias=bias
+        ).to(torch.bfloat16)
+        self.assertEqual(out.shape, (M, N))
+        torch.testing.assert_close(out, reference, rtol=0.05, atol=0.1)
+
+    def test_torch_w8a8_mxfp8_linear_prequantized(self):
+        M, K, N = 8, 256, 384
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        q_input, input_scale = sglang_per_token_group_quant_fp8(
+            x, 32, scale_ue8m0=True, scale_dtype=torch.uint8
+        )
+        input_scale = input_scale.view(torch.float8_e8m0fnu)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = (
+            torch.arange(N * (K // 32), dtype=torch.int16, device=self.device)
+            .remainder(8)
+            .add(120)
+            .to(torch.uint8)
+            .reshape(N, K // 32)
+        )
+        try:
+            out = torch_w8a8_fp8_linear(
+                q_input,
+                weight,
+                [1, 32],
+                weight_scale,
+                input_scale=input_scale,
+            )
+        except (RuntimeError, ValueError) as error:
+            if "Invalid scaling configuration" in str(error):
+                self.skipTest(f"PyTorch XPU MXFP8 scaled_mm is unavailable: {error}")
+            raise
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        reference = reference_mxfp8_matmul(
+            q_input,
+            input_scale,
+            weight,
+            weight_scale.view(torch.float8_e8m0fnu),
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=0.05, atol=0.1)
 
     def test_torch_w8a8_block_fp8_linear_shapes_and_dims(self):
         """Test small sizes with varied M, 2D/3D shapes, and bias to keep memory minimal."""
@@ -241,7 +357,7 @@ class TestXPUFP8Linear(CustomTestCase):
             torch.float8_e4m3fn
         )
         weight_scale = torch.ones(2, 2, dtype=torch.float32, device=self.device)
-        for block_size in ([], [128], [128, 128, 128], [1, 32], [64, 64]):
+        for block_size in ([], [128], [128, 128, 128], [64, 64]):
             with self.subTest(block_size=block_size), self.assertRaises(ValueError):
                 torch_w8a8_block_fp8_linear(x, weight, block_size, weight_scale)
 

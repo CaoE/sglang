@@ -68,8 +68,8 @@ if _is_musa:
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
 
-if _is_musa:
-    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
+if _is_musa or _is_xpu:
+    # MUSA/XPU keep the AOT group-quant op instead of the CUDA-only JIT path.
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
 if _is_hip:
@@ -468,6 +468,7 @@ def create_per_token_group_quant_fp8_output_scale(
     column_major_scales: bool,
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
+    scale_dtype: Optional[torch.dtype] = None,
 ):
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
@@ -486,6 +487,12 @@ def create_per_token_group_quant_fp8_output_scale(
                 "column_major_scales requires scale_tma_aligned=True "
                 "when scale_ue8m0 is enabled"
             )
+            if scale_dtype is not None:
+                return torch.empty(
+                    x_shape[:-1] + (x_shape[-1] // group_size,),
+                    device=device,
+                    dtype=scale_dtype,
+                )
             # Row-major UE8M0 keeps the scale as float32 power-of-two values,
             # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
             return torch.empty(
@@ -585,6 +592,21 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
+    if x.device.type == "xpu":
+        sgl_per_token_group_quant_8bit(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+        )
+        return
+
     assert eps == 1e-10, (
         f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
     )
@@ -613,6 +635,7 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    scale_dtype: Optional[torch.dtype] = None,
 ):
     assert x.shape[-1] % group_size == 0, (
         "the last dimension of `x` cannot be divisible by `group_size`"
@@ -640,6 +663,7 @@ def sglang_per_token_group_quant_fp8(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
+        scale_dtype=scale_dtype,
     )
 
     if x.shape[0] > 0:
