@@ -120,6 +120,9 @@ class XPUAttentionBackend(AttentionBackend):
     - XPU Graph support, see https://github.com/pytorch/pytorch/issues/162143
     """
 
+    supports_full_cuda_graph_chunked_prefix: bool = True
+    supports_prefill_cuda_graph_max_context_size: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1845,8 +1848,12 @@ class XPUAttentionBackend(AttentionBackend):
             )
         if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
             device = forward_batch.seq_lens.device
+            effective_context_len = (
+                getattr(forward_batch, "max_seq_len_override", None)
+                or self.max_context_len
+            )
             max_num_pages = (
-                self.max_context_len + self.page_size - 1
+                effective_context_len + self.page_size - 1
             ) // self.page_size
             m = FlashAttentionMetadata()
             m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
@@ -1857,7 +1864,7 @@ class XPUAttentionBackend(AttentionBackend):
             )
             self.full_cg_prefill_metadata = m
             self.full_cg_prefill_strided_indices = torch.arange(
-                0, self.max_context_len, self.page_size, device=device
+                0, effective_context_len, self.page_size, device=device
             )
             if self.use_sliding_window_kv_pool:
                 assert forward_batch.out_cache_loc is not None
@@ -1939,13 +1946,26 @@ class XPUAttentionBackend(AttentionBackend):
         m.max_seq_len_k = max_seq_len_k
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
+            effective_context_len = (
+                getattr(forward_batch, "max_seq_len_override", None)
+                or self.max_context_len
+            )
             m.max_seq_len_q = forward_batch.positions.numel()
-            m.max_seq_len_k = self.max_context_len
+            m.max_seq_len_k = effective_context_len
         self.forward_metadata = m
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """Graph-recordable ops for XPU graph (no-op: all metadata setup is
         host-side and lives in init_forward_metadata_out_graph)."""
+
+    def prepare_full_cuda_graph_chunked_prefix(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool,
+    ) -> None:
+        """Prepare backend-private metadata for chunked-prefix FullCG."""
+        pass
 
     def _init_local_attn_metadata(
         self,

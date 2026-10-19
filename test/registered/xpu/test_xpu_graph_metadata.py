@@ -287,6 +287,53 @@ class TestXPUGraphMetadata(CustomTestCase):
         ):
             PrefillCudaGraphRunner(_FakeModelRunner())
 
+    def test_full_prefill_context_aware_max_context_override(self):
+        """Verify that max_seq_len_override sizes the capture page table and bounds max_seq_len_k."""
+        page_size = 16
+        configured_max_context = 1024
+        override_max_context = 64
+
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.attention_chunk_size = None
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        backend.max_context_len = configured_max_context
+        backend.full_cg_prefill_metadata = None
+        backend.req_to_token = torch.zeros((1, override_max_context), dtype=torch.int32)
+
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            seq_lens=torch.tensor([32], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([32], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([32], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            out_cache_loc=None,
+            positions=torch.arange(32, dtype=torch.int64),
+            max_seq_len_override=override_max_context,
+        )
+
+        backend._init_full_cg_prefill_metadata(forward_batch, in_capture=True)
+
+        m = backend.full_cg_prefill_metadata
+        expected_pages = (override_max_context + page_size - 1) // page_size
+        self.assertEqual(m.page_table.shape[1], expected_pages)
+        self.assertEqual(
+            backend.full_cg_prefill_strided_indices.numel(), expected_pages
+        )
+        self.assertEqual(m.max_seq_len_k, override_max_context)
+
+    def test_xpu_attention_backend_chunked_prefix_and_max_context_capabilities(self):
+        """Verify that XPUAttentionBackend declares full chunked prefix and max context size capabilities."""
+        from sglang.srt.arg_groups.choices import (
+            CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+        )
+
+        self.assertTrue(XPUAttentionBackend.supports_full_cuda_graph_chunked_prefix)
+        self.assertTrue(
+            XPUAttentionBackend.supports_prefill_cuda_graph_max_context_size
+        )
+        self.assertIn("intel_xpu", CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS)
+
 
 if __name__ == "__main__":
     unittest.main()
