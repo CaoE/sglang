@@ -516,7 +516,9 @@ def set_torch_compile_config():
         envs.SGLANG_CPU_CPP_WRAPPER.get()
         or os.environ.get("TORCHINDUCTOR_CPP_WRAPPER", "0") == "1"
     ):
-        from sglang.srt.model_executor.cpu_c_shims import enable_cpu_cpp_wrapper
+        from sglang.srt.model_executor.runner_utils.cpu_c_shims import (
+            enable_cpu_cpp_wrapper,
+        )
 
         enable_cpu_cpp_wrapper()
 

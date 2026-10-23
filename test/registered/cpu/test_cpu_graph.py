@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
+
 import torch
 
 import sglang.srt.layers.layer_boundary.residual.stream as stream_mod
@@ -719,6 +721,93 @@ class TestCPUGraph(CustomTestCase):
         # Should select the padded static bucket, NOT dynamic_graph
         self.assertIs(selected[0][0], padded_graph)
         self.assertEqual(selected[0][1].input_ids.shape[0], 256)
+
+    def test_cpu_cpp_wrapper_config_and_shims_registration(self):
+        import torch._inductor.config as ic
+
+        with patch.dict(os.environ, {"SGLANG_CPU_CPP_WRAPPER": "1"}):
+            cpu_graph_runner_module.set_torch_compile_config()
+            self.assertTrue(ic.cpp_wrapper)
+            shims = ic.aot_inductor.custom_ops_to_c_shims
+            self.assertGreaterEqual(len(shims), 6)
+            registered_op_names = {op._schema.name for op in shims.keys()}
+            self.assertIn(
+                "sgl_kernel::multimodal_rotary_embedding_cpu", registered_op_names
+            )
+            self.assertIn("sgl_kernel::fp8_scaled_mm_cpu", registered_op_names)
+            self.assertIn("sgl_kernel::fused_experts_cpu", registered_op_names)
+            self.assertIn("sgl_kernel::shared_expert_cpu", registered_op_names)
+            self.assertIn("sgl_kernel::qkv_proj_with_rope", registered_op_names)
+            self.assertIn(
+                "sgl_kernel::qkv_proj_with_rope_fused_weight", registered_op_names
+            )
+
+    def test_cpu_cpp_wrapper_transformer_block_execution(self):
+        from sglang.srt.model_executor.runner_utils.cpu_c_shims import (
+            enable_cpu_cpp_wrapper,
+        )
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        rope = RotaryEmbedding(128, 128, 2048, 10000, True, torch.bfloat16)
+        model = _MiniTransformerBlock(rope)
+
+        cpu_graph_runner_module.register_fake_ops(1)
+        enable_cpu_cpp_wrapper()
+
+        num_tokens = 8
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.randn(num_tokens, 2048, dtype=torch.bfloat16),
+            positions=torch.arange(num_tokens, dtype=torch.int64),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int64),
+            out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens_sum=num_tokens,
+        )
+
+        with cpu_graph_patch_boundary_classes():
+            with forward_context(ForwardContext(attn_backend=None), forward_batch=fb):
+                compiled = torch.compile(model, backend="inductor")
+                out = compiled(fb.input_ids, fb.positions, fb)
+
+        self.assertEqual(out.shape, (num_tokens, 2048))
+
+    def test_cpu_cpp_wrapper_custom_ops_accuracy(self):
+
+        from sglang.srt.model_executor.runner_utils.cpu_c_shims import (
+            enable_cpu_cpp_wrapper,
+        )
+
+        cpu_graph_runner_module.register_fake_ops(1)
+        enable_cpu_cpp_wrapper()
+
+        class CustomOpModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.randn(64, dtype=torch.bfloat16))
+
+            def forward(self, pos, q, k, cs):
+                torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                    pos, q, k, 64, cs, [16, 24, 24], True, True
+                )
+                normed = torch.ops.sgl_kernel.rmsnorm_cpu(q, self.w, 1e-5)
+                act = torch.ops.sgl_kernel.silu_and_mul_cpu(normed)
+                return act
+
+        model = CustomOpModel()
+        pos = torch.zeros(3, 1, dtype=torch.int64)
+        q = torch.randn(1, 64, dtype=torch.bfloat16)
+        k = torch.randn(1, 64, dtype=torch.bfloat16)
+        cs = torch.randn(1024, 64, dtype=torch.bfloat16)
+
+        eager_out = model(pos, q.clone(), k.clone(), cs)
+
+        compiled = torch.compile(model, backend="inductor")
+        comp_out = compiled(pos, q.clone(), k.clone(), cs)
+
+        self.assertEqual(comp_out.shape, eager_out.shape)
+        self.assertTrue(torch.allclose(comp_out, eager_out, atol=1e-3, rtol=1e-3))
 
     @intel_amx_benchmark(
         extra_args=[
