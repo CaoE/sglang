@@ -512,6 +512,14 @@ def set_torch_compile_config():
     register_inductor_fallback_ops()
     monkey_patch_torch_compile()
 
+    if (
+        envs.SGLANG_CPU_CPP_WRAPPER.get()
+        or os.environ.get("TORCHINDUCTOR_CPP_WRAPPER", "0") == "1"
+    ):
+        from sglang.srt.model_executor.cpu_c_shims import enable_cpu_cpp_wrapper
+
+        enable_cpu_cpp_wrapper()
+
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # CPU decode graph buckets are normalized into decode.bs by ServerArgs.
@@ -642,7 +650,6 @@ def register_fake_ops(tp_size: int):
         w2_scale,
         w1_zero,
         w2_zero,
-        a1_scale,
         block_size,
         w1_bias,
         w2_bias,
