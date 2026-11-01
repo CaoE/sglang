@@ -262,6 +262,85 @@ class TestXPUGraphMetadata(CustomTestCase):
                 ):
                     PrefillCudaGraphRunner(_FakeModelRunner())
 
+    def test_encoder_decoder_graph_metadata_initialization_and_replay(self):
+        """Verify that for encoder-decoder models:
+        1. init_cuda_graph_state allocates page_table with max_context_len columns
+           and encoder_page_table with max_source_positions width.
+        2. _init_full_cg_decode_metadata binds encoder metadata and sets is_graph=True.
+        3. Replay correctly copies encoder_lens, computes prefix sums, and slices page tables.
+        """
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.is_encoder_decoder = True
+        backend.use_mla = False
+        backend.use_sliding_window_kv_pool = False
+        backend.attention_chunk_size = None
+        backend.topk = 0
+        backend.dcp_size = 1
+        backend.max_context_len = 2048
+        backend.page_size = 128
+        backend.device = torch.device("cpu")
+        backend.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(max_source_positions=1500)
+        )
+        backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2048)
+
+        # page_table must have max_context_len columns (not just max_num_pages=16)
+        self.assertEqual(
+            backend.decode_cuda_graph_metadata["page_table"].shape, (2, 2048)
+        )
+        self.assertEqual(
+            backend.encoder_metadata["encoder_page_table"].shape, (2, 2048)
+        )
+
+        req_to_token = torch.arange(2 * 4096, dtype=torch.int32).view(2, 4096)
+        backend.req_to_token = req_to_token
+
+        # Capture metadata binding
+        fb_capture = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            encoder_lens=torch.tensor([1500, 1500], dtype=torch.int32),
+            spec_info=None,
+            out_cache_loc=None,
+        )
+        backend._init_full_cg_decode_metadata(fb_capture, in_capture=True)
+        m = backend.decode_cuda_graph_metadata[2]
+        self.assertTrue(getattr(m, "is_graph", False))
+        self.assertIsNotNone(m.encoder_page_table)
+        self.assertIsNotNone(m.encoder_lens_int32)
+        self.assertIsNotNone(m.encoder_cu_seqlens_k)
+
+        # Replay update
+        fb_replay = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            encoder_lens=torch.tensor([500, 800], dtype=torch.int32),
+            encoder_lens_cpu=[500, 800],
+            spec_info=None,
+            out_cache_loc=None,
+        )
+        backend._init_full_cg_decode_metadata(fb_replay, in_capture=False)
+        self.assertEqual(m.encoder_max_seq_len_k, 800)
+        self.assertEqual(m.encoder_lens_int32.tolist(), [500, 800])
+        self.assertEqual(m.encoder_cu_seqlens_k.tolist(), [0, 500, 1300])
+        self.assertTrue(
+            torch.equal(m.encoder_page_table[0, :500], req_to_token[0, :500])
+        )
+        self.assertTrue(
+            torch.equal(m.encoder_page_table[1, :800], req_to_token[1, :800])
+        )
+        # Check decoder self-attention page table starts after encoder offset
+        self.assertTrue(torch.equal(m.page_table[0, :10], req_to_token[0, 500:510]))
+        self.assertTrue(torch.equal(m.page_table[1, :20], req_to_token[1, 800:820]))
+
 
 if __name__ == "__main__":
     unittest.main()

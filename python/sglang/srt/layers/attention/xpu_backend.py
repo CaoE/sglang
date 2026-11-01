@@ -219,22 +219,8 @@ class XPUAttentionBackend(AttentionBackend):
         self.num_splits = (
             1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
+        self.model_config = model_runner.model_config
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        if self.is_encoder_decoder:
-            from sglang.srt.model_executor.cuda_graph_config import (
-                cuda_graph_fully_disabled,
-            )
-
-            # Encoder-decoder cross-/self-attention below uses a dynamic-shape
-            # varlen KV gather (page_size=1 semantics) that cannot be captured.
-            # XPU disables CUDA graph by default, so this holds; the guard fails
-            # loudly if a future XPU graph path is force-enabled instead of
-            # silently mis-indexing through the paged graph-metadata path.
-            assert cuda_graph_fully_disabled(), (
-                "Encoder-decoder models (e.g. Whisper) on the intel_xpu attention "
-                "backend require CUDA graph disabled (off by default on XPU); the "
-                "graph decode path cannot run the varlen KV gather."
-            )
         if self.page_size == 1:
             from sglang.srt.model_executor.cuda_graph_config import (
                 cuda_graph_fully_disabled,
@@ -1202,6 +1188,74 @@ class XPUAttentionBackend(AttentionBackend):
         )
         return o[extend_rows]
 
+    def _forward_encoder_decoder_attn_graph(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        scale: float,
+        softcap: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Graph-safe encoder-decoder cross-/self-attention.
+
+        Executes cleanly inside an XPU Graph capture and replay:
+          - Tensor shapes are static and bound by the captured batch size and page_table width.
+          - Clamps page table lookups to avoid out-of-bounds indexing on inactive padding columns.
+          - Masks inactive token slots and safely zero-fills inactive requests without D2H syncs.
+        """
+        bs = page_table.shape[0]
+        max_len = page_table.shape[1]
+        if max_len == 0:
+            return q.new_zeros((q.shape[0], q.shape[1], value_cache.shape[-1]))
+
+        total_q = q.shape[0]
+        k_flat = key_cache.view(-1, key_cache.shape[-2], key_cache.shape[-1])
+        v_flat = value_cache.view(-1, value_cache.shape[-2], value_cache.shape[-1])
+
+        safe_pt = torch.clamp(page_table.long(), min=0, max=k_flat.shape[0] - 1)
+        k = k_flat[safe_pt].permute(0, 2, 1, 3)
+        v = v_flat[safe_pt].permute(0, 2, 1, 3)
+
+        q_4d = q.view(bs, max_seqlen_q, -1, q.shape[-1]).permute(0, 2, 1, 3)
+
+        col = torch.arange(max_len, device=page_table.device).unsqueeze(0)
+        key_mask = col < cache_seqlens.unsqueeze(1)
+
+        if causal and max_seqlen_q > 1:
+            row = torch.arange(max_seqlen_q, device=page_table.device).unsqueeze(1)
+            causal_cond = col <= (cache_seqlens.unsqueeze(1) - max_seqlen_q + row)
+            mask = key_mask.unsqueeze(1) & causal_cond
+        else:
+            mask = key_mask.unsqueeze(1).unsqueeze(2)
+
+        zero_rows = (cache_seqlens == 0).view(bs, 1, 1, 1)
+        safe_mask = mask | zero_rows
+
+        if softcap > 0.0:
+            h_q = q_4d.shape[1]
+            h_kv = k.shape[1]
+            if h_q != h_kv:
+                k = k.repeat_interleave(h_q // h_kv, dim=1)
+                v = v.repeat_interleave(h_q // h_kv, dim=1)
+            scores = torch.matmul(q_4d, k.transpose(-2, -1)) * scale
+            scores = torch.tanh(scores / softcap) * softcap
+            scores = scores.masked_fill(~safe_mask, float("-inf"))
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.matmul(probs, v)
+        else:
+            enable_gqa = q_4d.shape[1] != k.shape[1]
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q_4d, k, v, attn_mask=safe_mask, scale=scale, enable_gqa=enable_gqa
+            )
+
+        out = torch.where(zero_rows, torch.zeros_like(out), out)
+        return out.permute(0, 2, 1, 3).reshape(total_q, q.shape[1], -1)
+
     def _forward_encoder_decoder_attn(
         self,
         q: torch.Tensor,
@@ -1224,6 +1278,25 @@ class XPUAttentionBackend(AttentionBackend):
         this check -- and its two device-to-host syncs -- stays out of
         _forward_attn_flat_page_table and off that path.
         """
+        is_graph_capture = (
+            hasattr(torch.xpu, "is_current_stream_capturing")
+            and torch.xpu.is_current_stream_capturing()
+        ) or getattr(getattr(self, "forward_metadata", None), "is_graph", False)
+
+        if is_graph_capture:
+            return self._forward_encoder_decoder_attn_graph(
+                q=q,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                scale=scale,
+                softcap=softcap,
+                causal=causal,
+            )
+
         if int(cache_seqlens.max().item()) == 0:
             return q.new_zeros((q.shape[0], q.shape[1], value_cache.shape[-1]))
 
@@ -1674,6 +1747,9 @@ class XPUAttentionBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate fixed-size tensors reused across XPU graph captures."""
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        page_table_cols = (
+            self.max_context_len if self.is_encoder_decoder else max_num_pages
+        )
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_q": torch.arange(
@@ -1683,7 +1759,7 @@ class XPUAttentionBackend(AttentionBackend):
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             "page_table": torch.zeros(
-                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+                max_bs, page_table_cols, dtype=torch.int32, device=self.device
             ),
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
@@ -1697,9 +1773,15 @@ class XPUAttentionBackend(AttentionBackend):
                 max_num_tokens, dtype=torch.int64, device=self.device
             )
         if self.is_encoder_decoder:
+            encoder_page_cols = max(
+                self.max_context_len,
+                getattr(getattr(self, "model_config", None), "hf_config", None)
+                and getattr(self.model_config.hf_config, "max_source_positions", 0)
+                or 0,
+            )
             self.encoder_metadata = {
                 "encoder_page_table": torch.zeros(
-                    max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                    max_bs, encoder_page_cols, dtype=torch.int32, device=self.device
                 ),
                 "encoder_lens_int32": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -1789,6 +1871,7 @@ class XPUAttentionBackend(AttentionBackend):
             # Bind static-shape slices of the pre-allocated buffers so the
             # captured graph always reads from the same storage addresses.
             metadata = FlashAttentionMetadata()
+            metadata.is_graph = True
             metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                 "cache_seqlens"
             ][:bs]
@@ -1854,7 +1937,11 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
 
             encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)
-            metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
+            encoder_lens_cpu = getattr(forward_batch, "encoder_lens_cpu", None)
+            if encoder_lens_cpu is not None and len(encoder_lens_cpu) > 0:
+                metadata.encoder_max_seq_len_k = int(max(encoder_lens_cpu[:bs]))
+            else:
+                metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
             metadata.encoder_lens_int32.copy_(encoder_lens)
             metadata.encoder_cu_seqlens_k[0] = 0
             metadata.encoder_cu_seqlens_k[1 : bs + 1].copy_(
@@ -1865,6 +1952,7 @@ class XPUAttentionBackend(AttentionBackend):
                     req_pool_indices, : metadata.encoder_max_seq_len_k
                 ].to(torch.int32)
             )
+            metadata.encoder_page_table[:bs, metadata.encoder_max_seq_len_k :].zero_()
             # Self-attention (text) page_table: decoder tokens start after encoder tokens.
             text_max = metadata.max_seq_len_k
             arange_text = torch.arange(text_max, device=req_pool_indices.device)

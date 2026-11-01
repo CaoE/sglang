@@ -147,6 +147,79 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             causal=False,
         )
 
+    def test_encoder_decoder_graph_capture_and_replay_on_xpu(self):
+        """Verify that _forward_encoder_decoder_attn can be captured into an XPUGraph
+        and replayed with exact outputs matching eager reference."""
+        cache_seqlens = torch.tensor([5, 8], dtype=torch.int32).to(self.dev)
+        cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32).to(self.dev)
+        m = 8
+        page_table = (
+            torch.stack(
+                [
+                    torch.randperm(self.TOTAL_SLOTS)[:m]
+                    for _ in range(cache_seqlens.numel())
+                ]
+            )
+            .to(torch.int32)
+            .to(self.dev)
+        )
+        q = torch.randn(2, self.H, self.D, dtype=torch.bfloat16, device=self.dev)
+        scale, softcap = 0.5, 0.0
+        key_cache = self.k_flat.view(-1, 1, self.H, self.D)
+        value_cache = self.v_flat.view(-1, 1, self.H, self.D)
+
+        # Warmup and capture inside XPUGraph
+        stream = torch.xpu.Stream()
+        graph = torch.xpu.XPUGraph()
+        torch.xpu.synchronize()
+
+        # Warmup
+        for _ in range(2):
+            self.backend._forward_encoder_decoder_attn_graph(
+                q=q,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=1,
+                scale=scale,
+                softcap=softcap,
+                causal=False,
+            )
+
+        with torch.xpu.graph(xpu_graph=graph, stream=stream):
+            out = self.backend._forward_encoder_decoder_attn(
+                q=q,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=1,
+                scale=scale,
+                softcap=softcap,
+                causal=False,
+            )
+        torch.xpu.synchronize()
+
+        graph.replay()
+        torch.xpu.synchronize()
+
+        want = _sdpa_ref(
+            q=q,
+            k_flat=self.k_flat,
+            v_flat=self.v_flat,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            scale=scale,
+            causal=False,
+        )
+        self.assertEqual(tuple(out.shape), (2, self.H, self.D))
+        self.assertTrue(torch.isfinite(out).all(), "graph output must be finite")
+        torch.testing.assert_close(out.float(), want, rtol=2e-2, atol=2e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
