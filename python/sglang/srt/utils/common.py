@@ -476,7 +476,13 @@ def get_available_gpu_memory(
                 free_gpu_memory,
                 max(0, total_gpu_memory - used_memory),
             )
-        except Exception:
+        except (AttributeError, RuntimeError) as exc:
+            logger.debug(
+                "torch.xpu.mem_get_info failed for gpu_id=%s; using allocator "
+                "fallback: %s",
+                gpu_id,
+                exc,
+            )
             used_memory = torch.xpu.memory_allocated(gpu_id)
             total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
             free_gpu_memory = total_gpu_memory - used_memory

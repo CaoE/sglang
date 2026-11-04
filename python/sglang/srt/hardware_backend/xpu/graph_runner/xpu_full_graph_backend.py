@@ -48,39 +48,48 @@ def _allocate_output_buffer(output: Any) -> Optional[Any]:
     return None
 
 
-def _output_fits_buffer(output: torch.Tensor, output_buffer: Any) -> bool:
-    return (
-        torch.is_tensor(output_buffer)
-        and output.ndim == output_buffer.ndim
-        and output.shape[1:] == output_buffer.shape[1:]
-        and output.shape[0] <= output_buffer.shape[0]
-        and output.dtype == output_buffer.dtype
-        and output.device == output_buffer.device
-    )
+def _output_fits_buffer(output: Any, output_buffer: Any) -> bool:
+    if torch.is_tensor(output):
+        return (
+            torch.is_tensor(output_buffer)
+            and output.ndim == output_buffer.ndim
+            and output.shape[1:] == output_buffer.shape[1:]
+            and output.shape[0] <= output_buffer.shape[0]
+            and output.dtype == output_buffer.dtype
+            and output.device == output_buffer.device
+        )
+    if isinstance(output, (list, tuple)):
+        return (
+            isinstance(output_buffer, type(output))
+            and len(output) == len(output_buffer)
+            and all(
+                _output_fits_buffer(item, buffer)
+                for item, buffer in zip(output, output_buffer)
+            )
+        )
+    return False
 
 
 def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
     """Copy ``output`` leaf-wise into the leading rows of ``output_buffer`` and
     return the same structure of buffer views; None when it does not fit."""
+    if not _output_fits_buffer(output, output_buffer):
+        return None
+    return _copy_output_to_buffer_unchecked(output, output_buffer)
+
+
+def _copy_output_to_buffer_unchecked(output: Any, output_buffer: Any) -> Any:
     if torch.is_tensor(output):
-        if not _output_fits_buffer(output, output_buffer):
-            return None
         shared_output = output_buffer[: output.shape[0]]
         shared_output.copy_(output)
         return shared_output
     if isinstance(output, (list, tuple)):
-        if not isinstance(output_buffer, (list, tuple)) or len(output) != len(
-            output_buffer
-        ):
-            return None
         shared = [
-            _copy_output_to_buffer(item, buffer)
+            _copy_output_to_buffer_unchecked(item, buffer)
             for item, buffer in zip(output, output_buffer)
         ]
-        if any(item is None for item in shared):
-            return None
         return tuple(shared) if isinstance(output, tuple) else shared
-    return None
+    raise TypeError(f"Unsupported graph output type: {type(output).__name__}")
 
 
 logger = logging.getLogger(__name__)

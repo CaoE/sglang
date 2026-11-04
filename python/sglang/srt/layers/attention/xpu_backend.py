@@ -1540,7 +1540,7 @@ class XPUAttentionBackend(AttentionBackend):
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=1,
-                    max_seqlen_k=getattr(metadata, "encoder_max_seq_len_k", 0),
+                    max_seqlen_k=metadata.encoder_max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=(-1, -1),
@@ -1705,16 +1705,11 @@ class XPUAttentionBackend(AttentionBackend):
         if max_context <= split_threshold:
             return None
 
-        if max_context <= 16384:
-            return SeqLenBucketGraphVariants(
-                graph_limits=(("short", split_threshold),),
-                fallback_label="long",
-            )
+        graph_limits = [("short", split_threshold)]
+        if split_threshold < 16384 and max_context > 16384:
+            graph_limits.append(("medium", 16384))
         return SeqLenBucketGraphVariants(
-            graph_limits=(
-                ("short", split_threshold),
-                ("medium", 16384),
-            ),
+            graph_limits=tuple(graph_limits),
             fallback_label="long",
         )
 
@@ -1904,16 +1899,17 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(kv_seqlens, dim=0))
 
             encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)
-            metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
+            encoder_live_max = int(encoder_lens.max().item())
+            metadata.encoder_max_seq_len_k = (
+                metadata.encoder_page_table.shape[1] if in_capture else encoder_live_max
+            )
             metadata.encoder_lens_int32.copy_(encoder_lens)
             metadata.encoder_cu_seqlens_k[0] = 0
             metadata.encoder_cu_seqlens_k[1 : bs + 1].copy_(
                 torch.cumsum(encoder_lens, dim=0, dtype=torch.int32)
             )
-            metadata.encoder_page_table[:bs, : metadata.encoder_max_seq_len_k].copy_(
-                self.req_to_token[
-                    req_pool_indices, : metadata.encoder_max_seq_len_k
-                ].to(torch.int32)
+            metadata.encoder_page_table[:bs, :encoder_live_max].copy_(
+                self.req_to_token[req_pool_indices, :encoder_live_max].to(torch.int32)
             )
             # Self-attention (text) page_table: decoder tokens start after encoder tokens.
             text_max = metadata.max_seq_len_k
@@ -1961,7 +1957,9 @@ class XPUAttentionBackend(AttentionBackend):
             if variant == "short":
                 metadata.max_seq_len_k = min(self.max_context_len, split_threshold)
             elif variant == "medium":
-                metadata.max_seq_len_k = min(self.max_context_len, 16384)
+                metadata.max_seq_len_k = min(
+                    self.max_context_len, max(split_threshold, 16384)
+                )
             else:
                 metadata.max_seq_len_k = self.max_context_len
 
@@ -2033,15 +2031,23 @@ class XPUAttentionBackend(AttentionBackend):
                 "Full prefill graph does not support models with "
                 f"attention_chunk_size ({self.attention_chunk_size})."
             )
-        if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
-            device = forward_batch.seq_lens.device
-            effective_context_len = (
-                getattr(forward_batch, "max_seq_len_override", None)
-                or self.max_context_len
+        effective_context_len = (
+            getattr(forward_batch, "max_seq_len_override", None) or self.max_context_len
+        )
+        max_num_pages = (effective_context_len + self.page_size - 1) // self.page_size
+        existing_metadata = getattr(self, "full_cg_prefill_metadata", None)
+        if (
+            in_capture
+            and existing_metadata is not None
+            and existing_metadata.page_table.shape[1] < max_num_pages
+        ):
+            raise ValueError(
+                "XPU full prefill graph captures must use one fixed "
+                "max_seq_len_override; increasing it after capture would "
+                "invalidate metadata addresses held by earlier graphs."
             )
-            max_num_pages = (
-                effective_context_len + self.page_size - 1
-            ) // self.page_size
+        if in_capture and existing_metadata is None:
+            device = forward_batch.seq_lens.device
             m = FlashAttentionMetadata()
             m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
             m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
