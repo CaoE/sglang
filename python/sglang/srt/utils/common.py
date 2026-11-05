@@ -471,21 +471,18 @@ def get_available_gpu_memory(
             empty_device_cache(torch.xpu)
         try:
             free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
-            used_memory = torch.xpu.memory_allocated(gpu_id)
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
             free_gpu_memory = min(
-                free_gpu_memory,
-                max(0, total_gpu_memory - used_memory),
+                float(free_gpu_memory),
+                max(0.0, float(total_gpu_memory) - used_memory),
             )
-        except (AttributeError, RuntimeError) as exc:
-            logger.debug(
-                "torch.xpu.mem_get_info failed for gpu_id=%s; using allocator "
-                "fallback: %s",
-                gpu_id,
-                exc,
+        except Exception:
+            # Fallback for devices/drivers that do not support querying free memory
+            used_memory = float(torch.xpu.memory_allocated(gpu_id))
+            total_gpu_memory = float(
+                torch.xpu.get_device_properties(gpu_id).total_memory
             )
-            used_memory = torch.xpu.memory_allocated(gpu_id)
-            total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-            free_gpu_memory = total_gpu_memory - used_memory
+            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()

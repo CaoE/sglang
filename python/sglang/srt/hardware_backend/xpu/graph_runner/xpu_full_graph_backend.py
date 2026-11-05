@@ -44,6 +44,8 @@ def _allocate_output_buffer(output: Any) -> Optional[Any]:
         buffers = [_allocate_output_buffer(item) for item in output]
         if any(buffer is None for buffer in buffers):
             return None
+        if isinstance(output, tuple) and hasattr(output, "_fields"):
+            return type(output)(*buffers)
         return tuple(buffers) if isinstance(output, tuple) else buffers
     return None
 
@@ -59,8 +61,11 @@ def _output_fits_buffer(output: Any, output_buffer: Any) -> bool:
             and output.device == output_buffer.device
         )
     if isinstance(output, (list, tuple)):
+        expected_container = type(output)
+        if isinstance(output, tuple) and not hasattr(output, "_fields"):
+            expected_container = tuple
         return (
-            isinstance(output_buffer, type(output))
+            isinstance(output_buffer, expected_container)
             and len(output) == len(output_buffer)
             and all(
                 _output_fits_buffer(item, buffer)
@@ -88,6 +93,8 @@ def _copy_output_to_buffer_unchecked(output: Any, output_buffer: Any) -> Any:
             _copy_output_to_buffer_unchecked(item, buffer)
             for item, buffer in zip(output, output_buffer)
         ]
+        if isinstance(output, tuple) and hasattr(output, "_fields"):
+            return type(output)(*shared)
         return tuple(shared) if isinstance(output, tuple) else shared
     raise TypeError(f"Unsupported graph output type: {type(output).__name__}")
 

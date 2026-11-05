@@ -1,4 +1,5 @@
 import unittest
+from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ import torch
 
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
     FullXPUGraphBackend,
+    _allocate_output_buffer,
     _copy_output_to_buffer,
 )
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
@@ -433,7 +435,13 @@ class TestXPUGraphMetadata(CustomTestCase):
         self.assertEqual(variants_large_page.capture_labels, ("short", "long"))
         self.assertEqual(variants_large_page.graph_limits, (("short", 16384),))
 
-    def test_full_prefill_metadata_rejects_larger_capture_override(self):
+        backend.page_size = 64
+        variants_small_page = backend.get_decode_graph_variants(ForwardMode.DECODE, 1)
+        self.assertEqual(
+            variants_small_page.graph_limits, (("short", 2048), ("medium", 16384))
+        )
+
+    def test_full_prefill_metadata_rejects_mismatched_capture_override(self):
         page_size = 16
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
         backend.attention_chunk_size = None
@@ -461,6 +469,9 @@ class TestXPUGraphMetadata(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "one fixed max_seq_len_override"):
             backend._init_full_cg_prefill_metadata(capture_batch(128), in_capture=True)
 
+        with self.assertRaisesRegex(ValueError, "one fixed max_seq_len_override"):
+            backend._init_full_cg_prefill_metadata(capture_batch(32), in_capture=True)
+
     def test_nested_output_copy_is_atomic_on_shape_mismatch(self):
         output_buffer = (torch.zeros(2, 3), torch.zeros(2, 4))
         output = (torch.ones(1, 3), torch.ones(1, 5))
@@ -468,6 +479,16 @@ class TestXPUGraphMetadata(CustomTestCase):
 
         self.assertIsNone(_copy_output_to_buffer(output, output_buffer))
         self.assertTrue(torch.equal(output_buffer[0], first_leaf_before))
+
+    def test_namedtuple_output_buffer_reuse_preserves_type(self):
+        Output = namedtuple("Output", ("hidden", "aux"))
+        output = Output(torch.ones(1, 3), torch.ones(1, 2))
+        output_buffer = _allocate_output_buffer(output)
+
+        self.assertIsInstance(output_buffer, Output)
+        shared_output = _copy_output_to_buffer(output, output_buffer)
+        self.assertIsInstance(shared_output, Output)
+        self.assertTrue(torch.equal(shared_output.hidden, output.hidden))
 
 
 if __name__ == "__main__":

@@ -1572,11 +1572,7 @@ class XPUAttentionBackend(AttentionBackend):
                     cu_seqlens_q=local_attn_metadata.local_query_start_loc,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=local_attn_metadata.local_max_query_len,
-                    max_seqlen_k=getattr(
-                        local_attn_metadata,
-                        "local_max_seq_len",
-                        getattr(metadata, "max_seq_len_k", 0),
-                    ),
+                    max_seqlen_k=local_attn_metadata.local_max_seq_len,
                     softmax_scale=layer.scaling,
                     causal=True,
                     window_size=(-1, -1),
@@ -1702,12 +1698,17 @@ class XPUAttentionBackend(AttentionBackend):
         - effective_blocks <= 32: non-split single-workgroup execution (num_splits = 1).
         - effective_blocks > 32: split-KV multi-workgroup execution (num_splits > 1).
 
-        If max_context <= 32 * page_size (e.g. 4096):
+        TODO(XPU): Xe3 has a separate decode kernel and a different split
+        heuristic based on fixed 64-token blocks and batch/GQA occupancy. Until
+        that heuristic is validated for graph capture, use the Xe2 page-size
+        threshold here for both architectures.
+
+        If max_context <= 32 * page_size:
           A single default variant covers the entire model context without split overhead.
         If max_context <= 16384:
-          2 tiers: short (<= 4096) and long (fallback up to max_context).
+          2 tiers: short (<= 32 * page_size) and long (fallback up to max_context).
         If max_context > 16384:
-          3 tiers: short (<= 4096), medium (<= 16384), and long (fallback up to max_context).
+          3 tiers: short (<= 32 * page_size), medium (<= 16384), and long (fallback up to max_context).
         """
         if capture_forward_mode != ForwardMode.DECODE or captured_req_width != 1:
             return None
@@ -1974,6 +1975,13 @@ class XPUAttentionBackend(AttentionBackend):
                 )
             else:
                 metadata.max_seq_len_k = self.max_context_len
+            if (
+                metadata.local_attn_metadata is not None
+                and self.attention_chunk_size is not None
+            ):
+                metadata.local_attn_metadata.local_max_seq_len = min(
+                    self.attention_chunk_size, metadata.max_seq_len_k
+                )
 
         self.forward_metadata = metadata
 
@@ -2051,7 +2059,8 @@ class XPUAttentionBackend(AttentionBackend):
         if (
             in_capture
             and existing_metadata is not None
-            and existing_metadata.page_table.shape[1] < max_num_pages
+            and getattr(self, "_full_cg_prefill_context_len", None)
+            != effective_context_len
         ):
             raise ValueError(
                 "XPU full prefill graph captures must use one fixed "
@@ -2068,6 +2077,7 @@ class XPUAttentionBackend(AttentionBackend):
                 (bs, max_num_pages), dtype=torch.int32, device=device
             )
             self.full_cg_prefill_metadata = m
+            self._full_cg_prefill_context_len = effective_context_len
             self.full_cg_prefill_strided_indices = torch.arange(
                 0, effective_context_len, self.page_size, device=device
             )
@@ -2159,10 +2169,6 @@ class XPUAttentionBackend(AttentionBackend):
         m.max_seq_len_k = max_seq_len_k
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
-            effective_context_len = (
-                getattr(forward_batch, "max_seq_len_override", None)
-                or self.max_context_len
-            )
             m.max_seq_len_q = forward_batch.positions.numel()
             m.max_seq_len_k = effective_context_len
         self.forward_metadata = m
