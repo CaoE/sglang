@@ -89,9 +89,10 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, round_up
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, is_xpu, round_up
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -99,6 +100,12 @@ if _is_npu:
     )
 
     graph_runners_dict["npu"] = ViTNpuGraphRunner
+if _is_xpu:
+    from sglang.srt.hardware_backend.xpu.graph_runner.vit_xpu_graph_runner import (
+        ViTXpuGraphRunner,
+    )
+
+    graph_runners_dict["xpu"] = ViTXpuGraphRunner
 
 logger = logging.getLogger(__name__)
 

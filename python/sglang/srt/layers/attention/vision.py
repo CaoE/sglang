@@ -1094,10 +1094,16 @@ class VisionIntelXPUAttention(nn.Module):
         s_aux = kwargs.get("s_aux", None)
 
         cu_seqlens_source = cu_seqlens
-        cu_seqlens = resolve_seqlens(cu_seqlens_source, bsz, seq_len, device=q.device)
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+        if isinstance(cu_seqlens_source, (list, tuple)):
+            cu_seqlens, max_seqlen = cu_seqlens_source[0], cu_seqlens_source[1]
+        else:
+            cu_seqlens = resolve_seqlens(
+                cu_seqlens_source, bsz, seq_len, device=q.device
+            )
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
 
+        output = kwargs.get("output_ws", None)
         fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
@@ -1106,6 +1112,8 @@ class VisionIntelXPUAttention(nn.Module):
             softmax_scale=softmax_scale,
             window_size=window_size,
         )
+        if output is not None:
+            fa_kwargs["out"] = output
         if s_aux is not None:
             fa_kwargs["sinks"] = s_aux
         output = flash_attn_varlen_func(q, k, v, **fa_kwargs)

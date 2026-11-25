@@ -26,6 +26,7 @@
 import logging
 import re
 from array import array
+from collections import defaultdict
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -74,10 +75,26 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+
+graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
+        ViTNpuGraphRunner,
+    )
+
+    graph_runners_dict["npu"] = ViTNpuGraphRunner
+if _is_xpu:
+    from sglang.srt.hardware_backend.xpu.graph_runner.vit_xpu_graph_runner import (
+        ViTXpuGraphRunner,
+    )
+
+    graph_runners_dict["xpu"] = ViTXpuGraphRunner
 
 logger = logging.getLogger(__name__)
 
@@ -421,11 +438,13 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         # Resource prepared for vit cuda graph
         self.max_context_len = max_context_len
-        self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+        self.enable_cg = (
+            _is_cuda or _is_npu or _is_xpu
+        ) and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = None
         if self.enable_cg:
-            self.cuda_graph_runner = ViTCudaGraphRunner(self)
+            self.cuda_graph_runner = graph_runners_dict[self.device.type](self)
 
     def get_window_index(self, grid_thw):
         cu_window_seqlens: list = [0]
